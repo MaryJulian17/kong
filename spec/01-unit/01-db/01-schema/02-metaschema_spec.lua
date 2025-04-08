@@ -124,14 +124,14 @@ describe("metaschema", function()
     assert.truthy(MetaSchema:validate(s))
   end)
 
-  it("a schema can be marked as legacy", function()
+  it("a schema cannot be marked as legacy", function()
     local s = {
       name = "hello",
       primary_key = { "foo" },
       legacy = true,
       fields = {
         { foo = { type = "number" } } } }
-    assert.truthy(MetaSchema:validate(s))
+    assert.falsy(MetaSchema:validate(s))
 
     s = {
       name = "hello",
@@ -437,6 +437,32 @@ describe("metaschema", function()
       }
     }
     assert.truthy(MetaSchema:validate(s))
+  end)
+
+  it("populates the 'table_name' field from 'name' if not supplied", function()
+    local s = {
+      name = "testing",
+      primary_key = { "id" },
+      fields = {
+        { id = { type = "string", }, },
+        { foo = { type = "string" }, },
+      },
+    }
+
+    assert.truthy(MetaSchema:validate(s))
+    local schema = Schema.new(s)
+
+    assert.not_nil(schema.table_name)
+    assert.equals("testing", schema.name)
+    assert.equals("testing", schema.table_name)
+
+    s.table_name = "explicit_table_name"
+    assert.truthy(MetaSchema:validate(s))
+    schema = Schema.new(s)
+
+    assert.not_nil(schema.table_name)
+    assert.equals("testing", schema.name)
+    assert.equals("explicit_table_name", schema.table_name)
   end)
 
   describe("subschemas", function()
@@ -937,7 +963,7 @@ describe("metasubschema", function()
     }
     local ok, err = MetaSchema.MetaSubSchema:validate(s)
     assert.falsy(ok)
-    assert.match("only one of these fields must be non-empty",
+    assert.match("exactly one of these fields must be non-empty",
                  err.entity_checks[1]["@entity"][1], 1, true)
   end)
 
@@ -1093,4 +1119,265 @@ describe("metasubschema", function()
       assert.truthy(MetaSchema.MetaSubSchema:validate(schema))
     end)
   end
+
+  it("validates transformation has transformation function specified (positive)", function()
+    assert.truthy(MetaSchema.MetaSubSchema:validate({
+      name = "test",
+      fields = {
+        { test = { type = "string" } },
+      },
+      transformations = {
+        {
+          input = { "test" },
+          on_write = function() return true end,
+        },
+      },
+    }))
+
+    assert.truthy(MetaSchema.MetaSubSchema:validate({
+      name = "test",
+      fields = {
+        { test = { type = "string" } },
+      },
+      transformations = {
+        {
+          input = { "test" },
+          on_read = function() return true end,
+        },
+      },
+    }))
+
+    assert.truthy(MetaSchema.MetaSubSchema:validate({
+      name = "test",
+      fields = {
+        { test = { type = "string" } },
+      },
+      transformations = {
+        {
+          input = { "test" },
+          on_read = function() return true end,
+          on_write = function() return true end,
+        },
+      },
+    }))
+  end)
+
+  it("validates transformation has transformation function specified (negative)", function()
+    assert.falsy(MetaSchema.MetaSubSchema:validate({
+      name = "test",
+      fields = {
+        { test = { type = "string" } },
+      },
+      transformations = {
+        {
+          input = { "test" },
+        },
+      },
+    }))
+  end)
+
+  it("validates transformation input fields exists (positive)", function()
+    assert.truthy(MetaSchema.MetaSubSchema:validate({
+      name = "test",
+      fields = {
+        { test = { type = "string" } },
+      },
+      transformations = {
+        {
+          input = { "test" },
+          on_write = function() return true end,
+        },
+      },
+    }))
+  end)
+
+  it("validates transformation input fields exists (negative)", function()
+    assert.falsy(MetaSchema.MetaSubSchema:validate({
+      name = "test",
+      fields = {
+        { test = { type = "string" } },
+      },
+      transformations = {
+        {
+          input = { "nonexisting" },
+          on_write = function() return true end,
+        },
+      },
+    }))
+  end)
+
+  it("validates nested transformation input fields exists (positive)", function()
+    assert.truthy(MetaSchema.MetaSubSchema:validate({
+      name = "test",
+      fields = {
+        {
+          test = {
+            type = "record",
+            fields = {
+              {
+                field = { type = "string" }
+              },
+            }
+          }
+        },
+      },
+      transformations = {
+        {
+          input = { "test.field" },
+          on_write = function() return true end,
+        },
+      },
+    }))
+  end)
+
+  it("validates nested transformation input fields exists (negative)", function()
+    assert.falsy(MetaSchema.MetaSubSchema:validate({
+      name = "test",
+      fields = {
+        {
+          test = {
+            type = "record",
+            fields = {
+              {
+                field = { type = "string" },
+              },
+            },
+          },
+        },
+      },
+      transformations = {
+        {
+          input = { "test.nonexisting" },
+          on_write = function() return true end,
+        },
+      },
+    }))
+
+    assert.falsy(MetaSchema.MetaSubSchema:validate({
+      name = "test",
+      fields = {
+        {
+          test = {
+            type = "record",
+            fields = {
+              {
+                field = { type = "string" },
+              },
+            },
+          },
+        },
+      },
+      transformations = {
+        {
+          input = { "nonexisting.field" },
+          on_write = function() return true end,
+        },
+      },
+    }))
+  end)
+
+  it("validates transformation needs fields exists (positive)", function()
+    assert.truthy(MetaSchema.MetaSubSchema:validate({
+      name = "test",
+      fields = {
+        { test = { type = "string" } },
+      },
+      transformations = {
+        {
+          input = { "test" },
+          needs = { "test" },
+          on_write = function() return true end,
+        },
+      },
+    }))
+  end)
+
+  it("validates transformation needs fields exists (negative)", function()
+    assert.falsy(MetaSchema.MetaSubSchema:validate({
+      name = "test",
+      fields = {
+        { test = { type = "string" } },
+      },
+      transformations = {
+        {
+          input = { "test" },
+          needs = { "nonexisting" },
+          on_write = function() return true end,
+        },
+      },
+    }))
+  end)
+
+  it("validates nested transformation needs fields exists (positive)", function()
+    assert.truthy(MetaSchema.MetaSubSchema:validate({
+      name = "test",
+      fields = {
+        {
+          test = {
+            type = "record",
+            fields = {
+              {
+                field = { type = "string" }
+              },
+            }
+          }
+        },
+      },
+      transformations = {
+        {
+          input = { "test.field" },
+          needs = { "test.field" },
+          on_write = function() return true end,
+        },
+      },
+    }))
+  end)
+
+  it("validates nested transformation needs fields exists (negative)", function()
+    assert.falsy(MetaSchema.MetaSubSchema:validate({
+      name = "test",
+      fields = {
+        {
+          test = {
+            type = "record",
+            fields = {
+              {
+                field = { type = "string" },
+              },
+            },
+          },
+        },
+      },
+      transformations = {
+        {
+          input = { "test.field" },
+          needs = { "test.nonexisting" },
+          on_write = function() return true end,
+        },
+      },
+    }))
+
+    assert.falsy(MetaSchema.MetaSubSchema:validate({
+      name = "test",
+      fields = {
+        {
+          test = {
+            type = "record",
+            fields = {
+              {
+                field = { type = "string" },
+              },
+            },
+          },
+        },
+      },
+      transformations = {
+        {
+          input = { "test.field" },
+          needs = { "nonexisting.field" },
+          on_write = function() return true end,
+        },
+      },
+    }))
+  end)
 end)

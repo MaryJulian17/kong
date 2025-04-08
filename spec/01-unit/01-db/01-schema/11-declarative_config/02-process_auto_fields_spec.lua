@@ -35,6 +35,7 @@ describe("declarative config: process_auto_fields", function()
           - name: foo
             host: example.com
             protocol: https
+            enabled: true
             _comment: my comment
             _ignore:
             - foo: bar
@@ -59,6 +60,7 @@ describe("declarative config: process_auto_fields", function()
               read_timeout = 60000,
               write_timeout = 60000,
               retries = 5,
+              enabled = true,
               _comment = "my comment",
               _ignore = { { foo = "bar" } },
             },
@@ -71,6 +73,7 @@ describe("declarative config: process_auto_fields", function()
               read_timeout = 60000,
               write_timeout = 60000,
               retries = 5,
+              enabled = true,
               _comment = "my comment",
               _ignore = { { foo = "bar" } },
             }
@@ -101,6 +104,7 @@ describe("declarative config: process_auto_fields", function()
               read_timeout = 60000,
               write_timeout = 60000,
               retries = 5,
+              enabled = true,
             }
           }
         }, config)
@@ -149,6 +153,8 @@ describe("declarative config: process_auto_fields", function()
               protocols = { "grpc", "grpcs", "http", "https" },
               config = {
                 hide_credentials = false,
+                key_in_header = true,
+                key_in_query = true,
                 key_in_body = false,
                 key_names = { "apikey" },
                 run_on_preflight = true,
@@ -199,6 +205,8 @@ describe("declarative config: process_auto_fields", function()
               protocols = { "grpc", "grpcs", "http", "https" },
               config = {
                 hide_credentials = false,
+                key_in_header = true,
+                key_in_query = true,
                 key_in_body = false,
                 key_names = { "apikey" },
                 run_on_preflight = true,
@@ -250,7 +258,8 @@ describe("declarative config: process_auto_fields", function()
                 read_timeout = 60000,
                 write_timeout = 60000,
                 retries = 5,
-                plugins = {}
+                plugins = {},
+                enabled = true,
               }
             }
           }, config)
@@ -298,6 +307,7 @@ describe("declarative config: process_auto_fields", function()
                 read_timeout = 60000,
                 write_timeout = 60000,
                 retries = 5,
+                enabled = true,
                 _comment = "my comment",
                 _ignore = { { foo = "bar" } },
                 plugins = {
@@ -309,6 +319,8 @@ describe("declarative config: process_auto_fields", function()
                     protocols = { "grpc", "grpcs", "http", "https" },
                     config = {
                       hide_credentials = false,
+                      key_in_header = true,
+                      key_in_query = true,
                       key_in_body = false,
                       key_names = { "apikey" },
                       run_on_preflight = true,
@@ -340,6 +352,7 @@ describe("declarative config: process_auto_fields", function()
                 read_timeout = 60000,
                 write_timeout = 60000,
                 retries = 5,
+                enabled = true,
                 plugins = {
                   {
                     name = "basic-auth",
@@ -391,6 +404,7 @@ describe("declarative config: process_auto_fields", function()
                 read_timeout = 60000,
                 write_timeout = 60000,
                 retries = 5,
+                enabled = true,
                 routes = {}
               }
             }
@@ -438,6 +452,7 @@ describe("declarative config: process_auto_fields", function()
                 read_timeout = 60000,
                 write_timeout = 60000,
                 retries = 5,
+                enabled = true,
                 routes = {
                   {
                     paths = { "/path" },
@@ -447,6 +462,8 @@ describe("declarative config: process_auto_fields", function()
                     path_handling = "v1",
                     protocols = { "http", "https" },
                     https_redirect_status_code = 426,
+                    request_buffering = true,
+                    response_buffering = true,
                   },
                   {
                     hosts = { "example.com" },
@@ -456,6 +473,8 @@ describe("declarative config: process_auto_fields", function()
                     path_handling = "v1",
                     protocols = { "http", "https" },
                     https_redirect_status_code = 426,
+                    request_buffering = true,
+                    response_buffering = true,
                   },
                   {
                     methods = { "GET", "POST" },
@@ -465,6 +484,8 @@ describe("declarative config: process_auto_fields", function()
                     path_handling = "v1",
                     protocols = { "http", "https" },
                     https_redirect_status_code = 426,
+                    request_buffering = true,
+                    response_buffering = true,
                   },
                 }
               },
@@ -477,6 +498,7 @@ describe("declarative config: process_auto_fields", function()
                 read_timeout = 60000,
                 write_timeout = 60000,
                 retries = 5,
+                enabled = true,
                 routes = {
                   {
                     paths = { "/path" },
@@ -488,6 +510,8 @@ describe("declarative config: process_auto_fields", function()
                     path_handling = "v1",
                     protocols = { "http", "https" },
                     https_redirect_status_code = 426,
+                    request_buffering = true,
+                    response_buffering = true,
                   },
                 }
               }
@@ -524,6 +548,7 @@ describe("declarative config: process_auto_fields", function()
                 read_timeout = 60000,
                 write_timeout = 60000,
                 retries = 5,
+                enabled = true,
                 routes = {
                   {
                     name = "foo",
@@ -534,7 +559,9 @@ describe("declarative config: process_auto_fields", function()
                     protocols = { "http", "https" },
                     regex_priority = 0,
                     https_redirect_status_code = 426,
-                    plugins = {}
+                    request_buffering = true,
+                    response_buffering = true,
+                    plugins = {},
                   }
                 }
               }
@@ -587,6 +614,7 @@ describe("declarative config: process_auto_fields", function()
                 read_timeout = 60000,
                 write_timeout = 60000,
                 retries = 5,
+                enabled = true,
                 routes = {
                   {
                     name = "foo",
@@ -597,6 +625,8 @@ describe("declarative config: process_auto_fields", function()
                     protocols = { "http", "https" },
                     regex_priority = 0,
                     https_redirect_status_code = 426,
+                    request_buffering = true,
+                    response_buffering = true,
                     plugins = {
                       {
                         name = "key-auth",
@@ -604,6 +634,8 @@ describe("declarative config: process_auto_fields", function()
                         protocols = { "grpc", "grpcs", "http", "https" },
                         config = {
                           hide_credentials = false,
+                          key_in_header = true,
+                          key_in_query = true,
                           key_in_body = false,
                           key_names = { "apikey" },
                           run_on_preflight = true,
@@ -637,6 +669,7 @@ describe("declarative config: process_auto_fields", function()
                 read_timeout = 60000,
                 write_timeout = 60000,
                 retries = 5,
+                enabled = true,
                 routes = {
                   {
                     name = "bar",
@@ -647,6 +680,8 @@ describe("declarative config: process_auto_fields", function()
                     protocols = { "http", "https" },
                     regex_priority = 0,
                     https_redirect_status_code = 426,
+                    request_buffering = true,
+                    response_buffering = true,
                     plugins = {
                       {
                         name = "basic-auth",

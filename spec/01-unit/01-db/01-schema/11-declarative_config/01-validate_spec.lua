@@ -13,7 +13,10 @@ describe("declarative config: validate", function()
 
   lazy_setup(function()
     local _
-    DeclarativeConfig, _, DeclarativeConfig_def = assert(declarative_config.load(helpers.test_conf.loaded_plugins))
+    DeclarativeConfig, _, DeclarativeConfig_def = assert(declarative_config.load(
+      helpers.test_conf.loaded_plugins,
+      helpers.test_conf.loaded_vaults
+    ))
   end)
 
   pending("metaschema", function()
@@ -25,7 +28,7 @@ describe("declarative config: validate", function()
   end)
 
   describe("_format_version", function()
-    it("requires version 1.1 or 2.1", function()
+    it("requires version 1.1 or 2.1 or 3.0", function()
 
       local ok, err = DeclarativeConfig:validate(lyaml.load([[
         _format_version: 1.1
@@ -40,7 +43,7 @@ describe("declarative config: validate", function()
       ]]))
       assert.falsy(ok)
       assert.same({
-        ["_format_version"] = "expected one of: 1.1, 2.1"
+        ["_format_version"] = "expected one of: 1.1, 2.1, 3.0"
       }, err)
 
       assert(DeclarativeConfig:validate(lyaml.load([[
@@ -190,7 +193,7 @@ describe("declarative config: validate", function()
               ["host"] = "expected a string",
               ["path"] = "must not have empty segments",
               ["port"] = "value should be between 0 and 65535",
-              ["protocol"] = "expected one of: grpc, grpcs, http, https, tcp, tls",
+              ["protocol"] = "expected one of: grpc, grpcs, http, https, tcp, tls, tls_passthrough, udp",
               ["retries"] = "value should be between 0 and 32767",
             }
           }
@@ -447,7 +450,7 @@ describe("declarative config: validate", function()
                 ["routes"] = {
                   {
                     ["paths"] = {
-                      "should start with: /"
+                      "should start with: / (fixed path) or ~/ (regex path)"
                     }
                   }
                 }
@@ -595,6 +598,22 @@ describe("declarative config: validate", function()
         end)
       end)
 
+    end)
+
+    describe("vaults", function()
+      it("accepts vaults", function()
+        local config = assert(lyaml.load([[
+          _format_version: "1.1"
+          vaults:
+          - prefix: aba
+            config:
+              prefix: "BANANA_"
+            description: "Banana vault"
+            tags: ~
+            name: env
+        ]]))
+        assert(DeclarativeConfig:validate(config))
+      end)
     end)
   end)
 
@@ -849,5 +868,71 @@ describe("declarative config: validate", function()
       end)
 
     end)
+  end)
+end)
+
+describe("declarative config: validate", function()
+
+  local daos = {
+    {
+      name = "dao-keywords",
+      primary_key = {"field1"},
+      admin_api_name = "dao-keywords",
+      admin_api_nested_name = "dao-keywords",
+      fields = {
+        {field1 = {type = "string", required = true}},
+        {field2 = {type = "string", required = true}},
+      }
+    }
+  }
+
+  local plugins_set = helpers.test_conf.loaded_plugins
+  plugins_set["dao-keywords"] = true
+
+  lazy_setup(function()
+    package.loaded["kong.plugins.dao-keywords.schema"] = {
+      name = "dao-keywords",
+      fields = {
+        { config = {
+            type = "record",
+            fields = {},
+        }, },
+      }
+    }
+
+    package.loaded["kong.plugins.dao-keywords.daos"] = daos
+  end)
+
+  lazy_teardown(function()
+    package.loaded["kong.plugins.dao-keywords.schema"] = nil
+    package.loaded["kong.plugins.dao-keywords.daos"] = nil
+  end)
+
+  it("loads plugins with custom DAO that has keywords as string", function()
+    daos[1]["fields"][2] = {plugins = {type = "string", required = true}}
+
+    assert(declarative_config.load(plugins_set))
+  end)
+
+  it("loads plugins with custom DAO that has keywords as array", function()
+    daos[1]["fields"][2] = {
+      plugins = {
+        type = "array",
+        required = false,
+        elements = {
+          type = "string",
+        },
+      },
+    }
+
+    assert(declarative_config.load(plugins_set))
+  end)
+
+  it("rejects plugin with custom DAO in old, hash-like format", function()
+       daos["dao-keywords"] = daos[1]
+       table.remove(daos, 1)
+       local ok, err = declarative_config.load(plugins_set)
+       assert.falsy(ok)
+       assert.same("custom plugin 'dao-keywords' returned non-array daos definition table", err)
   end)
 end)

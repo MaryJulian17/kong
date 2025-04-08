@@ -1,7 +1,7 @@
 local helpers = require "spec.helpers"
 local cjson = require "cjson"
 
-describe("Postgres query locks", function()
+describe("#postgres Postgres query locks", function()
   local client
 
   setup(function()
@@ -20,7 +20,7 @@ describe("Postgres query locks", function()
       nginx_conf = "spec/fixtures/custom_nginx.template",
       plugins = "slow-query",
       pg_max_concurrent_queries = 1,
-      pg_semaphore_timeout = 100,
+      pg_semaphore_timeout = 200,
     }))
     client = helpers.admin_client()
   end)
@@ -40,7 +40,9 @@ describe("Postgres query locks", function()
     })
     assert.res_status(204 , res)
 
-    -- make a request that would run a query while no resources are available
+    -- wait for zero-delay timer
+    helpers.wait_timer("slow-query", true, "any-running")
+
     res = assert(client:send {
       method = "GET",
       path = "/slow-resource",
@@ -49,5 +51,6 @@ describe("Postgres query locks", function()
     local body = assert.res_status(500 , res)
     local json = cjson.decode(body)
     assert.same({ error = "error acquiring query semaphore: timeout" }, json)
+
   end)
 end)

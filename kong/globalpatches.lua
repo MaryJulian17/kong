@@ -45,19 +45,60 @@ return function(options)
     -- the resty-lock is based on sleeping while waiting, but that api
     -- is unavailable. Hence we implement a BLOCKING sleep, only in
     -- the init_worker context.
-    local get_phase= ngx.get_phase
+    local get_phase = ngx.get_phase
     local ngx_sleep = ngx.sleep
-    local alternative_sleep = require("socket").sleep
+    local alternative_sleep = function(t)
+      require("socket").sleep(t)
+      -- the ngx sleep will yield and hence update time, this implementation
+      -- does not, so we must force a time update to prevent time based loops
+      -- from getting into a deadlock/spin.
+      -- See https://github.com/Kong/lua-resty-worker-events/issues/41
+      ngx.update_time()
+    end
 
     -- luacheck: globals ngx.sleep
+    local blocking_sleep_phases = {
+      init = true,
+      init_worker = true,
+    }
     ngx.sleep = function(s)
-      if get_phase() == "init_worker" then
-        ngx.log(ngx.WARN, "executing a blocking 'sleep' (", s, " seconds)")
+      if blocking_sleep_phases[get_phase()] then
+        ngx.log(ngx.NOTICE, "executing a blocking 'sleep' (", s, " seconds)")
         return alternative_sleep(s)
       end
       return ngx_sleep(s)
     end
 
+  end
+
+
+  do
+    _G.native_timer_at = ngx.timer.at
+    _G.native_timer_every = ngx.timer.every
+
+    local _timerng
+
+    if options.cli or options.rbusted then
+      _timerng = require("resty.timerng").new({
+        min_threads = 16,
+        max_threads = 32,
+      })
+
+      _timerng:start()
+
+    else
+      _timerng = require("resty.timerng").new()
+    end
+
+    _G.timerng = _timerng
+
+    _G.ngx.timer.at = function (delay, callback, ...)
+      return _timerng:at(delay, callback, ...)
+    end
+
+    _G.ngx.timer.every = function (interval, callback, ...)
+      return _timerng:every(interval, callback, ...)
+    end
   end
 
 
@@ -228,65 +269,109 @@ return function(options)
     -- This patched method will create a unique seed per worker process,
     -- using a combination of both time and the worker's pid.
     local util = require "kong.tools.utils"
-    local seeds = {}
+    local seeded = {}
     local randomseed = math.randomseed
 
     _G.math.randomseed = function()
-      local seed = seeds[ngx.worker.pid()]
-      if not seed then
-        if not options.cli
-          and (ngx.get_phase() ~= "init_worker" and ngx.get_phase() ~= "init")
-        then
-          ngx.log(ngx.WARN, debug.traceback("math.randomseed() must be " ..
-              "called in init or init_worker context", 2))
-        end
+      local pid = ngx.worker.pid()
+      local id
+      local is_seeded
+      local phase = ngx.get_phase()
+      if phase == "init" then
+        id = "master"
+        is_seeded = seeded.master
 
-        local bytes, err = util.get_rand_bytes(8)
-        if bytes then
-          ngx.log(ngx.DEBUG, "seeding PRNG from OpenSSL RAND_bytes()")
-
-          local t = {}
-          for i = 1, #bytes do
-            local byte = string.byte(bytes, i)
-            t[#t+1] = byte
-          end
-          local str = table.concat(t)
-          if #str > 12 then
-            -- truncate the final number to prevent integer overflow,
-            -- since math.randomseed() could get cast to a platform-specific
-            -- integer with a different size and get truncated, hence, lose
-            -- randomness.
-            -- double-precision floating point should be able to represent numbers
-            -- without rounding with up to 15/16 digits but let's use 12 of them.
-            str = string.sub(str, 1, 12)
-          end
-          seed = tonumber(str)
-        else
-          ngx.log(ngx.ERR, "could not seed from OpenSSL RAND_bytes, seeding ",
-                           "PRNG with time and worker pid instead (this can ",
-                           "result to duplicated seeds): ", err)
-
-          seed = ngx.now()*1000 + ngx.worker.pid()
-        end
-
-        ngx.log(ngx.DEBUG, "random seed: ", seed, " for worker nb ",
-                            ngx.worker.id())
-
-        if not options.cli then
-          local ok, err = ngx.shared.kong:safe_set("pid: " .. ngx.worker.pid(), seed)
-          if not ok then
-            ngx.log(ngx.WARN, "could not store PRNG seed in kong shm: ", err)
-          end
-        end
-
-        randomseed(seed)
-        seeds[ngx.worker.pid()] = seed
       else
-        ngx.log(ngx.DEBUG, debug.traceback("attempt to seed random number " ..
-            "generator, but already seeded with: " .. tostring(seed), 2))
+        id = ngx.worker.id()
+        is_seeded = seeded[pid]
       end
 
-      return seed
+
+      if is_seeded then
+        ngx.log(ngx.DEBUG, debug.traceback("attempt to seed already seeded random number " ..
+                                           "generator on process #" .. tostring(pid), 2))
+        return
+      end
+
+      if not options.cli and (phase ~= "init_worker" and phase ~= "init") then
+        ngx.log(ngx.WARN, debug.traceback("math.randomseed() must be called in " ..
+                                          "init or init_worker context", 2))
+      end
+
+      local seed
+      local bytes, err = util.get_rand_bytes(8)
+      if bytes then
+        ngx.log(ngx.DEBUG, "seeding PRNG from OpenSSL RAND_bytes()")
+
+        local t = {}
+        for i = 1, #bytes do
+          local byte = string.byte(bytes, i)
+          t[#t+1] = byte
+        end
+
+        local str = table.concat(t)
+        if #str > 12 then
+          -- truncate the final number to prevent integer overflow,
+          -- since math.randomseed() could get cast to a platform-specific
+          -- integer with a different size and get truncated, hence, lose
+          -- randomness.
+          -- double-precision floating point should be able to represent numbers
+          -- without rounding with up to 15/16 digits but let's use 12 of them.
+          str = string.sub(str, 1, 12)
+        end
+
+        seed = tonumber(str)
+
+      else
+        ngx.log(ngx.ERR, "could not seed from OpenSSL RAND_bytes, seeding ",
+                         "PRNG with time and process id instead (this can ",
+                         "result to duplicated seeds): ", err)
+
+        seed = ngx.now() * 1000 + pid
+      end
+
+      if not options.cli then
+        local kong_shm = ngx.shared.kong
+        if id == "master" then
+          local worker_count = ngx.worker.count()
+          local old_worker_count = kong_shm:get("worker:count")
+          if old_worker_count and old_worker_count > worker_count then
+            for i = worker_count, old_worker_count - 1 do
+              local old_worker_pid = kong_shm:get("pids:" .. i)
+              if old_worker_pid then
+                seeded[old_worker_pid] = nil
+                kong_shm:delete("pids:" .. i)
+                kong_shm:delete("kong:mem:" .. old_worker_pid)
+              end
+            end
+          end
+
+          if old_worker_count ~= worker_count then
+            local ok, err = kong_shm:safe_set("worker:count", worker_count)
+            if not ok then
+              ngx.log(ngx.WARN, "could not store worker count in kong shm: ", err)
+            end
+          end
+
+          seeded.master = true
+
+        else
+          local old_worker_pid = kong_shm:get("pids:" .. id)
+          if old_worker_pid then
+            seeded[old_worker_pid] = nil
+            kong_shm:delete("kong:mem:" .. old_worker_pid)
+          end
+
+          local ok, err = kong_shm:safe_set("pids:" .. id, pid)
+          if not ok then
+            ngx.log(ngx.WARN, "could not store process id in kong shm: ", err)
+          end
+
+          seeded[pid] = true
+        end
+      end
+
+      return randomseed(seed)
     end
   end
 
@@ -366,7 +451,24 @@ return function(options)
     end
 
     -- STEP 5: load code that should be using the patched versions, if any (because of dependency chain)
-    toip = require("resty.dns.client").toip  -- this will load utils and penlight modules for example
-  end
-end
+    do
+      local client = package.loaded["kong.resty.dns.client"]
+      if not client then
+        client = require("kong.tools.dns")()
+      end
 
+      toip = client.toip
+
+      -- DNS query is lazily patched, it will only be wrapped
+      -- when instrumentation module is initialized later and
+      -- `opentelemetry_tracing` includes "dns_query" or set
+      -- to "all".
+      local instrumentation = require "kong.tracing.instrumentation"
+      instrumentation.set_patch_dns_query_fn(toip, function(wrap)
+        toip = wrap
+      end)
+    end
+  end
+
+  require "kong.deprecation".init(options.cli)
+end

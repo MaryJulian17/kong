@@ -19,15 +19,6 @@ return {
               default = {},
           }, },
         },
-        shorthands = {
-          -- deprecated forms, to be removed in Kong 3.0
-          { blacklist = function(value)
-              return { deny = value }
-            end },
-          { whitelist = function(value)
-              return { allow = value }
-            end },
-        },
     }, },
   },
 }

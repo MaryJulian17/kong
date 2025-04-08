@@ -23,6 +23,42 @@ local function validate_periods_order(config)
 end
 
 
+local function is_dbless()
+  local _, database, role = pcall(function()
+    return kong.configuration.database,
+           kong.configuration.role
+  end)
+
+  return database == "off" or role == "control_plane"
+end
+
+
+local policy
+if is_dbless() then
+  policy = {
+    type = "string",
+    default = "local",
+    len_min = 0,
+    one_of = {
+      "local",
+      "redis",
+    },
+  }
+
+else
+  policy = {
+    type = "string",
+    default = "local",
+    len_min = 0,
+    one_of = {
+      "local",
+      "cluster",
+      "redis",
+    },
+  }
+end
+
+
 return {
   name = "rate-limiting",
   fields = {
@@ -39,22 +75,22 @@ return {
           { limit_by = {
               type = "string",
               default = "consumer",
-              one_of = { "consumer", "credential", "ip", "service", "header" },
+              one_of = { "consumer", "credential", "ip", "service", "header", "path" },
           }, },
           { header_name = typedefs.header_name },
-          { policy = {
-              type = "string",
-              default = "cluster",
-              len_min = 0,
-              one_of = { "local", "cluster", "redis" },
-          }, },
-          { fault_tolerant = { type = "boolean", default = true }, },
+          { path = typedefs.path },
+          { policy = policy },
+          { fault_tolerant = { type = "boolean", required = true, default = true }, },
           { redis_host = typedefs.host },
           { redis_port = typedefs.port({ default = 6379 }), },
-          { redis_password = { type = "string", len_min = 0 }, },
+          { redis_password = { type = "string", len_min = 0, referenceable = true }, },
+          { redis_username = { type = "string", referenceable = true }, },
+          { redis_ssl = { type = "boolean", required = true, default = false, }, },
+          { redis_ssl_verify = { type = "boolean", required = true, default = false }, },
+          { redis_server_name = typedefs.sni },
           { redis_timeout = { type = "number", default = 2000, }, },
           { redis_database = { type = "integer", default = 0 }, },
-          { hide_client_headers = { type = "boolean", default = false }, },
+          { hide_client_headers = { type = "boolean", required = true, default = false }, },
         },
         custom_validator = validate_periods_order,
       },
@@ -73,6 +109,10 @@ return {
     { conditional = {
       if_field = "config.limit_by", if_match = { eq = "header" },
       then_field = "config.header_name", then_match = { required = true },
+    } },
+    { conditional = {
+      if_field = "config.limit_by", if_match = { eq = "path" },
+      then_field = "config.path", then_match = { required = true },
     } },
     { conditional = {
       if_field = "config.policy", if_match = { eq = "redis" },

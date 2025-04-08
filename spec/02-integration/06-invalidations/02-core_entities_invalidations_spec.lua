@@ -67,7 +67,6 @@ for _, strategy in helpers.each_strategy() do
         db_update_frequency   = POLL_INTERVAL,
         db_update_propagation = db_update_propagation,
         nginx_conf            = "spec/fixtures/custom_nginx.template",
-        router_update_frequency = POLL_INTERVAL,
       })
 
       assert(helpers.start_kong {
@@ -78,7 +77,6 @@ for _, strategy in helpers.each_strategy() do
         admin_listen          = "0.0.0.0:9001",
         db_update_frequency   = POLL_INTERVAL,
         db_update_propagation = db_update_propagation,
-        router_update_frequency = POLL_INTERVAL,
       })
 
       admin_client_1 = helpers.http_client("127.0.0.1", 8001)
@@ -160,14 +158,18 @@ for _, strategy in helpers.each_strategy() do
         -- because our test instance only has 1 worker
 
         do
-          local res = assert(proxy_client_1:send {
-            method  = "GET",
-            path    = "/status/200",
-            headers = {
-              host = "example.com",
-            }
-          })
-          assert.res_status(200, res)
+          helpers.wait_until(function()
+            local res = assert(proxy_client_1:send {
+              method  = "GET",
+              path    = "/status/200",
+              headers = {
+                host = "example.com",
+              }
+            })
+            return pcall(function()
+              assert.res_status(200, res)
+            end)
+          end, 10)
         end
 
         assert_proxy_2_wait({
@@ -199,14 +201,18 @@ for _, strategy in helpers.each_strategy() do
 
         -- TEST: ensure new host value maps to our Service
 
-        local res_1 = assert(proxy_client_1:send {
-          method  = "GET",
-          path    = "/",
-          headers = {
-            host = "updated-example.com",
-          }
-        })
-        assert.res_status(200, res_1)
+        helpers.wait_until(function()
+          local res_1 = assert(proxy_client_1:send {
+            method  = "GET",
+            path    = "/",
+            headers = {
+              host = "updated-example.com",
+            }
+          })
+          return pcall(function()
+            assert.res_status(200, res_1)
+          end)
+        end, 10)
 
         -- TEST: ensure old host value does not map anywhere
 
@@ -250,14 +256,18 @@ for _, strategy in helpers.each_strategy() do
         -- no need to wait for workers propagation (lua-resty-worker-events)
         -- because our test instance only has 1 worker
 
-        local res_1 = assert(proxy_client_1:send {
-          method  = "GET",
-          path    = "/",
-          headers = {
-            host = "updated-example.com",
-          }
-        })
-        assert.res_status(404, res_1)
+        helpers.wait_until(function()
+          local res_1 = assert(proxy_client_1:send {
+            method  = "GET",
+            path    = "/",
+            headers = {
+              host = "updated-example.com",
+            }
+          })
+          return pcall(function()
+            assert.res_status(404, res_1)
+          end)
+        end, 10)
 
         assert_proxy_2_wait({
           method  = "GET",
@@ -295,14 +305,18 @@ for _, strategy in helpers.each_strategy() do
 
         -- populate cache on both nodes
 
-        local res_1 = assert(proxy_client_1:send {
-          method  = "GET",
-          path    = "/status/200",
-          headers = {
-            host = "service.com",
-          }
-        })
-        assert.res_status(200, res_1)
+        helpers.wait_until(function()
+          local res_1 = assert(proxy_client_1:send {
+            method  = "GET",
+            path    = "/status/200",
+            headers = {
+              host = "service.com",
+            }
+          })
+          return pcall(function()
+            assert.res_status(200, res_1)
+          end)
+        end, 10)
 
         assert_proxy_2_wait({
           method  = "GET",
@@ -329,14 +343,18 @@ for _, strategy in helpers.each_strategy() do
         -- no need to wait for workers propagation (lua-resty-worker-events)
         -- because our test instance only has 1 worker
 
-        local res_1 = assert(proxy_client_1:send {
-          method  = "GET",
-          path    = "/",
-          headers = {
-            host = "service.com",
-          }
-        })
-        assert.res_status(418, res_1)
+        helpers.wait_until(function()
+          local res_1 = assert(proxy_client_1:send {
+            method  = "GET",
+            path    = "/",
+            headers = {
+              host = "service.com",
+            }
+          })
+          return pcall(function()
+            assert.res_status(418, res_1)
+          end)
+        end, 10)
 
         assert_proxy_2_wait({
           method  = "GET",
@@ -434,6 +452,13 @@ for _, strategy in helpers.each_strategy() do
         -- no need to wait for workers propagation (lua-resty-worker-events)
         -- because our test instance only has 1 worker
 
+        helpers.wait_until(function()
+          local cert_1 = get_cert(8443, "ssl-example.com")
+          return pcall(function()
+            assert.certificate(cert_1).has.cn("ssl-example.com")
+          end)
+        end)
+
         local cert_1 = get_cert(8443, "ssl-example.com")
         assert.certificate(cert_1).has.cn("ssl-example.com")
 
@@ -504,6 +529,8 @@ for _, strategy in helpers.each_strategy() do
 
         -- no need to wait for workers propagation (lua-resty-worker-events)
         -- because our test instance only has 1 worker
+
+        ngx.sleep(0.01)   -- wait events sync
 
         local cert_1 = get_cert(8443, "new-ssl-example.com")
         assert.certificate(cert_1).has.cn("ssl-alt.com")
@@ -657,6 +684,13 @@ for _, strategy in helpers.each_strategy() do
 
           -- no need to wait for workers propagation (lua-resty-worker-events)
           -- because our test instance only has 1 worker
+
+          helpers.wait_until(function()
+            local cert = get_cert(8443, "test.wildcard.com")
+            return pcall(function()
+              assert.certificate(cert).has.cn("ssl-alt-alt.com")
+            end)
+          end)
 
           local cert = get_cert(8443, "test.wildcard.com")
           assert.certificate(cert).has.cn("ssl-alt-alt.com")
@@ -816,14 +850,20 @@ for _, strategy in helpers.each_strategy() do
         -- populate cache with a miss on
         -- both nodes
 
-        local res_1 = assert(proxy_client_1:send {
-          method  = "GET",
-          path    = "/status/200",
-          headers = {
-            host = "dummy.com",
-          }
-        })
-        assert.res_status(200, res_1)
+        local res_1
+        helpers.wait_until(function()
+          res_1 = assert(proxy_client_1:send {
+            method  = "GET",
+            path    = "/status/200",
+            headers = {
+              host = "dummy.com",
+            }
+          })
+          return pcall(function()
+            assert.res_status(200, res_1)
+          end)
+        end, 10)
+
         assert.is_nil(res_1.headers["Dummy-Plugin"])
 
         assert_proxy_2_wait({
@@ -861,15 +901,20 @@ for _, strategy in helpers.each_strategy() do
 
         -- no need to wait for workers propagation (lua-resty-worker-events)
         -- because our test instance only has 1 worker
-        local res_1 = assert(proxy_client_1:send {
-          method  = "GET",
-          path    = "/status/200",
-          headers = {
-            host = "dummy.com",
-          }
-        })
-        assert.res_status(200, res_1)
-        assert.equal("1", res_1.headers["Dummy-Plugin"])
+
+        helpers.wait_until(function()
+          local res_1 = assert(proxy_client_1:send {
+            method  = "GET",
+            path    = "/status/200",
+            headers = {
+              host = "dummy.com",
+            }
+          })
+          return pcall(function()
+            assert.res_status(200, res_1)
+            assert.equal("1", res_1.headers["Dummy-Plugin"])
+          end)
+        end, 10)
 
         assert_proxy_2_wait({
           method  = "GET",
@@ -898,15 +943,19 @@ for _, strategy in helpers.each_strategy() do
         -- no need to wait for workers propagation (lua-resty-worker-events)
         -- because our test instance only has 1 worker
 
-        local res_1 = assert(proxy_client_1:send {
-          method  = "GET",
-          path    = "/status/200",
-          headers = {
-            host = "dummy.com",
-          }
-        })
-        assert.res_status(200, res_1)
-        assert.equal("2", res_1.headers["Dummy-Plugin"])
+        helpers.wait_until(function()
+          local res_1 = assert(proxy_client_1:send {
+            method  = "GET",
+            path    = "/status/200",
+            headers = {
+              host = "dummy.com",
+            }
+          })
+          return pcall(function()
+            assert.res_status(200, res_1)
+            assert.equal("2", res_1.headers["Dummy-Plugin"])
+          end)
+        end, 10)
 
         assert_proxy_2_wait({
           method  = "GET",
@@ -927,15 +976,19 @@ for _, strategy in helpers.each_strategy() do
         -- no need to wait for workers propagation (lua-resty-worker-events)
         -- because our test instance only has 1 worker
 
-        local res_1 = assert(proxy_client_1:send {
-          method  = "GET",
-          path    = "/status/200",
-          headers = {
-            host = "dummy.com",
-          }
-        })
-        assert.res_status(200, res_1)
-        assert.is_nil(res_1.headers["Dummy-Plugin"])
+        helpers.wait_until(function()
+          local res_1 = assert(proxy_client_1:send {
+            method  = "GET",
+            path    = "/status/200",
+            headers = {
+              host = "dummy.com",
+            }
+          })
+          return pcall(function()
+            assert.res_status(200, res_1)
+            assert.is_nil(res_1.headers["Dummy-Plugin"])
+          end)
+        end, 10)
 
         assert_proxy_2_wait({
           method  = "GET",
@@ -994,15 +1047,19 @@ for _, strategy in helpers.each_strategy() do
         -- no need to wait for workers propagation (lua-resty-worker-events)
         -- because our test instance only has 1 worker
 
-        local res_1 = assert(proxy_client_1:send {
-          method  = "GET",
-          path    = "/status/200",
-          headers = {
-            host = "dummy.com",
-          }
-        })
-        assert.res_status(200, res_1)
-        assert.equal("1", res_1.headers["Dummy-Plugin"])
+        helpers.wait_until(function()
+          local res_1 = assert(proxy_client_1:send {
+            method  = "GET",
+            path    = "/status/200",
+            headers = {
+              host = "dummy.com",
+            }
+          })
+          return pcall(function()
+            assert.res_status(200, res_1)
+            assert.equal("1", res_1.headers["Dummy-Plugin"])
+          end)
+        end, 10)
 
         assert_proxy_2_wait({
           method  = "GET",
@@ -1033,15 +1090,19 @@ for _, strategy in helpers.each_strategy() do
         -- no need to wait for workers propagation (lua-resty-worker-events)
         -- because our test instance only has 1 worker
 
-        local res_1 = assert(proxy_client_1:send {
-          method  = "GET",
-          path    = "/status/200",
-          headers = {
-            host = "dummy.com",
-          }
-        })
-        assert.res_status(200, res_1)
-        assert.is_nil(res_1.headers["Dummy-Plugin"])
+        helpers.wait_until(function()
+          local res_1 = assert(proxy_client_1:send {
+            method  = "GET",
+            path    = "/status/200",
+            headers = {
+              host = "dummy.com",
+            }
+          })
+          return pcall(function()
+            assert.res_status(200, res_1)
+            assert.is_nil(res_1.headers["Dummy-Plugin"])
+          end)
+        end, 10)
 
         assert_proxy_2_wait({
           method  = "GET",
@@ -1172,14 +1233,18 @@ for _, strategy in helpers.each_strategy() do
         -- no need to wait for workers propagation (lua-resty-worker-events)
         -- because our test instance only has 1 worker
 
-        local res_1 = assert(proxy_client_1:send {
-          method  = "GET",
-          path    = "/status/200",
-          headers = {
-            host = "propagation.test",
-          }
-        })
-        assert.res_status(200, res_1)
+        helpers.wait_until(function()
+          local res_1 = assert(proxy_client_1:send {
+            method  = "GET",
+            path    = "/status/200",
+            headers = {
+              host = "propagation.test",
+            }
+          })
+          return pcall(function()
+            assert.res_status(200, res_1)
+          end)
+        end, 10)
 
         assert_proxy_2_wait({
           method  = "GET",

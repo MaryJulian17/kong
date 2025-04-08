@@ -14,6 +14,7 @@ local PHASES = {
   rewrite           = 0x00000010,
   access            = 0x00000020,
   balancer          = 0x00000040,
+  response          = 0x00000080,
   --content         = 0x00000100,
   header_filter     = 0x00000200,
   body_filter       = 0x00000400,
@@ -27,13 +28,17 @@ local PHASES = {
 
 
 do
-  local n = 0
+  local t = {}
   for k, v in pairs(PHASES) do
-    n = n + 1
+    t[k] = v
+  end
+
+  for k, v in pairs(t) do
     PHASES[v] = k
   end
 
-  PHASES.n = n
+  -- max lshift limit, 2^30 = 0x40000000
+  PHASES.n = 30
 end
 
 
@@ -64,13 +69,14 @@ local function check_phase(accepted_phases)
     return
   end
 
-  local current_phase = kong.ctx.core.phase
+  local current_phase = ngx.ctx.KONG_PHASE
   if not current_phase then
     if ngx_get_phase() == "content" then
       -- treat custom content blocks as the Admin API
       current_phase = PHASES.admin_api
     else
-      error("no phase in kong.ctx.core.phase")
+      error(fmt("no phase in ngx.ctx.KONG_PHASE, (need one of %s)",
+                table.concat(get_phases_names(accepted_phases), ", ")))
     end
   end
 
@@ -93,9 +99,9 @@ local function check_not_phase(rejected_phases)
     return
   end
 
-  local current_phase = kong.ctx.core.phase
+  local current_phase = ngx.ctx.KONG_PHASE
   if not current_phase then
-    error("no phase in kong.ctx.core.phase")
+    error("no phase in ngx.ctx.KONG_PHASE")
   end
 
   if band(current_phase, rejected_phases) == 0 then
@@ -116,6 +122,7 @@ end
 local public_phases = setmetatable({
   request = new_phase(PHASES.rewrite,
                       PHASES.access,
+                      PHASES.response,
                       PHASES.header_filter,
                       PHASES.body_filter,
                       PHASES.log,

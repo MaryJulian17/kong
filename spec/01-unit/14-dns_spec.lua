@@ -5,38 +5,15 @@ local utils = require "kong.tools.utils"
 local ws_id = utils.uuid()
 
 local function setup_it_block()
-  local cache_table = {}
-
-  local function mock_cache(cache_table, limit)
-    return {
-      safe_set = function(self, k, v)
-        if limit then
-          local n = 0
-          for _, _ in pairs(cache_table) do
-            n = n + 1
-          end
-          if n >= limit then
-            return nil, "no memory"
-          end
-        end
-        cache_table[k] = v
-        return true
-      end,
-      get = function(self, k, _, fn, arg)
-        if cache_table[k] == nil then
-          cache_table[k] = fn(arg)
-        end
-        return cache_table[k]
-      end,
-    }
-  end
-
+  local client = require "kong.resty.dns.client"
   mocker.setup(finally, {
     kong = {
       configuration = {
         worker_consistency = "strict",
       },
-      core_cache = mock_cache(cache_table),
+      core_cache = {
+        get = function() return {} end
+      }
     },
     ngx = {
       ctx = {
@@ -45,6 +22,14 @@ local function setup_it_block()
     }
   })
   balancer.init()
+
+  client.init {
+    hosts = {},
+    resolvConf = {},
+    nameservers = { "8.8.8.8" },
+    enable_ipv6 = true,
+    order = { "LAST", "SRV", "A", "CNAME" },
+  }
 end
 
 -- simple debug function
@@ -55,27 +40,15 @@ end
 
 describe("DNS", function()
   local resolver, query_func, old_new
-  local mock_records, singletons, client
+  local mock_records
+
+  local kong = {}
+
+  _G.kong = kong
 
   lazy_setup(function()
     stub(ngx, "log")
-    singletons = require "kong.singletons"
-
-    singletons.core_cache = {
-      get = function() return {} end
-    }
-
-    --[[
-    singletons.db = {}
-    singletons.db.upstreams = {
-      find_all = function(self) return {} end
-    }
-    --]]
-
-    singletons.origins = {}
-
     resolver = require "resty.dns.resolver"
-    client = require "resty.dns.client"
   end)
 
   lazy_teardown(function()
@@ -120,13 +93,6 @@ describe("DNS", function()
       return r
     end
 
-    client.init {
-      hosts = {},
-      resolvConf = {},
-      nameservers = { "8.8.8.8" },
-      enable_ipv6 = true,
-      order = { "LAST", "SRV", "A", "CNAME" },
-    }
   end)
 
   after_each(function()

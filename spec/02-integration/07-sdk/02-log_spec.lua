@@ -17,7 +17,7 @@ local function find_in_file(f, pat)
 end
 
 
-describe("SDK: kong.log", function()
+describe("PDK: kong.log", function()
   local proxy_client
   local bp, db
 
@@ -86,7 +86,7 @@ describe("SDK: kong.log", function()
 
       local cfg = helpers.test_conf
       local logs = pl_file.read(cfg.prefix .. "/" .. cfg.proxy_error_log)
-      local _, count = logs:gsub([[executing plugin "logger%-last": log]], "")
+      local _, count = logs:gsub("%[logger%-last%] log phase", "")
 
       return count == 2
     end, 10)

@@ -1,8 +1,8 @@
 # Contributing to Kong :monkey_face:
 
 Hello, and welcome! Whether you are looking for help, trying to report a bug,
-thinking about getting involved in the project or about to submit a patch, this
-document is for you! Its intent is to be both an entry point for newcomers to
+thinking about getting involved in the project, or about to submit a patch, this
+document is for you! It intends to be both an entry point for newcomers to
 the community (with various technical backgrounds), and a guide/reference for
 contributors and maintainers.
 
@@ -32,15 +32,15 @@ Consult the Table of Contents below, and jump to the desired section.
 
 ### Enterprise Edition
 
-If you are a Kong Enterprise customer, contact the Enterprise Support channels
+If you are a Kong Enterprise customer, you may contact the Enterprise Support channels
 by opening an Enterprise support ticket on
 [https://support.konghq.com](https://support.konghq.com/).
 
-If you are experiencing a P1 issue, please call the [24/7 Enterprise Support
+If you are experiencing a P1 issue, please call at the [24/7 Enterprise Support
 phone line](https://support.konghq.com/hc/en-us/articles/115004921808-Telephone-Support)
 for immediate assistance, as published in the Customer Success Reference Guide.
 
-If you are interested in becoming a Kong Enterprise customer, please visit
+If you are interested in becoming a Kong Enterprise customer, please to visit
 https://konghq.com/kong-enterprise-edition/ or contact us at
 [sales@konghq.com](mailto:sales@konghq.com).
 
@@ -48,10 +48,10 @@ https://konghq.com/kong-enterprise-edition/ or contact us at
 
 ### Community Edition
 
-There are several channels where you can get answers from the community
+There are multiple channels where you can get answers from the community
 or the maintainers of this project:
 
-- Our public forum, [Kong Nation](https://discuss.konghq.com), is great for
+- Our public forum, [Kong Nation](https://discuss.konghq.com) is great for
   asking questions, giving advice, and staying up-to-date with the latest
   announcements. Kong Nation is frequented by Kong maintainers.
 - Two chat channels are used by the community, but are rarely visited by Kong
@@ -69,12 +69,12 @@ more than willing to assist you on those channels!
 ## Where to report bugs?
 
 Feel free to [submit an issue](https://github.com/Kong/kong/issues/new/choose) on
-the GitHub repository, we would be grateful to hear about it! Please make sure
-to respect the GitHub issue template, and include:
+the GitHub repository, we would be grateful to hear about it! Please make sure that you
+respect the GitHub issue template, and include:
 
 1. A summary of the issue
-2. A list of steps to reproduce the issue
-3. The version of Kong you encountered the issue with
+2. A list of steps to help reproduce the issue
+3. The version of Kong that you encountered the issue with
 4. Your Kong configuration, or the parts that are relevant to your issue
 
 If you wish, you are more than welcome to propose a patch to fix the issue!
@@ -86,7 +86,7 @@ on how to best do so.
 ## Where to submit feature requests?
 
 You can [submit an issue](https://github.com/Kong/kong/issues/new/choose) for feature
-requests. Please add as much detail as you can when doing so.
+requests. Please make sure to add as much detail as you can when doing so.
 
 You are also welcome to propose patches adding new features. See the section
 on [Submitting a patch](#submitting-a-patch) for details.
@@ -95,7 +95,7 @@ on [Submitting a patch](#submitting-a-patch) for details.
 
 ## Contributing
 
-We welcome contributions of all kinds, you do not need to code to be helpful!
+We welcome contributions of all kinds, there is no need to do code to be helpful!
 All of the following tasks are noble and worthy contributions that you can
 make without coding:
 
@@ -115,7 +115,7 @@ patch](#submitting-a-patch) section.
 ### Improving the documentation
 
 The documentation hosted at https://docs.konghq.com is open source and built
-with [Jekyll](https://jekyllrb.com/). You are welcome to propose changes to it
+with [Jekyll](https://jekyllrb.com/). You are very welcome to propose changes to it
 (correct typos, add examples or clarifications...) and contribute to the
 [Kong Hub](https://docs.konghq.com/hub/)!
 
@@ -130,7 +130,7 @@ We **do not** accept new plugins into the core repository. The plugins that are
 currently part of this repository are there because of historical reasons, but
 will be pushed into separate repositories in the foreseeable future.
 
-If you wish to write a new plugin for your own needs, you should start by
+If you are interested in writing a new plugin for your own needs, you should begin by
 reading the [Plugin Development
 Guide](https://docs.konghq.com/latest/plugin-development).
 
@@ -144,9 +144,7 @@ of the Plugin Development Guide.
 
 To give visibility to your plugin, we advise that you:
 
-1. [Add your
-   plugin](https://github.com/Kong/docs.konghq.com/blob/master/CONTRIBUTING.md#contributing-to-kong-documentation-and-the-kong-hub)
-   to the [Kong Hub](https://docs.konghq.com/hub/)
+1. Add your plugin to the [Kong Hub](https://docs.konghq.com/hub/)
 2. Create a post in the [Announcements category of Kong
    Nation](https://discuss.konghq.com/c/announcements)
 
@@ -160,13 +158,11 @@ first!
 
 When contributing, please follow the guidelines provided in this document. They
 will cover topics such as the different Git branches we use, the commit message
-format to use or the appropriate code style.
+format to use, or the appropriate code style.
 
-Once you have read them, and you are ready to submit your Pull Request, be sure
+Once you have read them, and you feel that you are ready to submit your Pull Request, be sure
 to verify a few things:
 
-- Your work was based on the appropriate branch (`master` vs. `next`), and you
-  are opening your Pull Request against the appropriate one
 - Your commit history is clean: changes are atomic and the git message format
   was respected
 - Rebase your work on top of the base branch (seek help online on how to use
@@ -176,7 +172,7 @@ to verify a few things:
   development documentation for additional details)
 - The tests are passing: run `make test`, `make test-all`, or whichever is
   appropriate for your change
-- Do not update CHANGELOG.md yourself. Your change will be included there in
+- Do not update CHANGELOG.md yourself. Your change will be included therein
   due time if it is accepted, no worries!
 
 If the above guidelines are respected, your Pull Request has all its chances
@@ -184,7 +180,7 @@ to be considered and will be reviewed by a maintainer.
 
 If you are asked to update your patch by a reviewer, please do so! Remember:
 **you are responsible for pushing your patch forward**. If you contributed it,
-you are probably the one in need of it. You must be prepared to apply changes
+you are probably the one in need of it. You must be ready to apply changes
 to it if necessary.
 
 If your Pull Request was accepted and fixes a bug, adds functionality, or
@@ -198,13 +194,6 @@ not forget to include your name if you are an external contributor. :wink:
 [Back to TOC](#table-of-contents)
 
 #### Git branches
-
-We work on two branches: `master`, where non-breaking changes land, and `next`,
-where important features or breaking changes land in-between major releases.
-
-When contributing to Kong, this distinction is important. Please ensure that
-you are basing your work on top of the appropriate branch, it might save you
-some time down the road!
 
 If you have write access to the GitHub repository, please follow the following
 naming scheme when pushing your branch(es):
@@ -380,7 +369,7 @@ $ luacheck .
 #### Writing tests
 
 We use [busted](https://olivinelabs.com/busted/) to write our tests. Your patch
-should include the related test updates or additions, in the appropriate test
+must include the related test updates or additions, in the appropriate test
 suite.
 
 - `spec/01-unit` gathers our unit tests (to test a given Lua module or
@@ -394,7 +383,7 @@ suite.
 
 A few guidelines when writing tests:
 
-- Use appropriate `describe` and `it` blocks, so it's obvious what is being
+- Make sure to use appropriate `describe` and `it` blocks, so it's obvious to what is being
   tested exactly
 - Ensure the atomicity of your tests: no test should be asserting two
   unrelated behaviors at the same time
@@ -522,7 +511,7 @@ contributors should find themselves at ease when contributing to Kong.
 When you are unsure about the style to adopt, please browse other parts of the
 codebase to find a similar case, and stay consistent with it.
 
-You might also notice places in the code base where the described style is not
+You might also notice places in the codebase where the described style is not
 respected. This is due to legacy code. **Contributions to update the code to
 the recommended style are welcome!**
 

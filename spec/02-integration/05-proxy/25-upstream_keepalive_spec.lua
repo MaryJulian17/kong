@@ -25,7 +25,7 @@ local fixtures = {
 }
 
 
-describe("upstream keepalive", function()
+describe("#postgres upstream keepalive", function()
   local proxy_client
 
   local function start_kong(opts)
@@ -39,8 +39,7 @@ describe("upstream keepalive", function()
       kopts[k] = v
     end
 
-    -- cleanup logs
-    os.execute(":> " .. helpers.test_conf.nginx_err_logs)
+    helpers.clean_logfile()
 
     assert(helpers.start_kong(kopts, nil, nil, fixtures))
 
@@ -203,38 +202,4 @@ describe("upstream keepalive", function()
           .line("enabled connection keepalive", true)
   end)
 
-
-  describe("deprecated properties", function()
-    it("nginx_upstream_keepalive = NONE disables connection pooling", function()
-      start_kong({
-        nginx_upstream_keepalive = "NONE",
-      })
-
-      local res = assert(proxy_client:send {
-        method = "GET",
-        path = "/echo_sni",
-        headers = {
-          Host = "one.com",
-        }
-      })
-      local body = assert.res_status(200, res)
-      assert.equal("SNI=one.com", body)
-      assert.errlog()
-            .not_has
-            .line("enabled connection keepalive", true)
-
-      local res = assert(proxy_client:send {
-        method = "GET",
-        path = "/echo_sni",
-        headers = {
-          Host = "two.com",
-        }
-      })
-      local body = assert.res_status(200, res)
-      assert.equal("SNI=two.com", body)
-      assert.errlog()
-            .not_has
-            .line("enabled connection keepalive", true)
-    end)
-  end)
 end)

@@ -3,9 +3,11 @@ local helpers = require "spec.helpers"
 local cjson   = require "cjson"
 local path_handling_tests = require "spec.fixtures.router_path_handling_tests"
 
+local tonumber = tonumber
 
 local enable_buffering
 local enable_buffering_plugin
+local stream_tls_listen_port = 9020
 
 
 local function insert_routes(bp, routes)
@@ -71,6 +73,7 @@ local function insert_routes(bp, routes)
     local cfg = bp.done()
     local yaml = declarative.to_yaml_string(cfg)
     local admin_client = helpers.admin_client()
+
     local res = assert(admin_client:send {
       method  = "POST",
       path    = "/config",
@@ -85,6 +88,8 @@ local function insert_routes(bp, routes)
     admin_client:close()
 
   end
+
+  ngx.sleep(0.5)  -- temporary wait for worker events and timers
 
   return routes
 end
@@ -117,12 +122,15 @@ local function remove_routes(strategy, routes)
   admin_api.plugins:remove(enable_buffering_plugin)
 end
 
+--for _, flavor in ipairs({ "traditional", "traditional_compatible" }) do
+for _, flavor in ipairs({ "traditional", "traditional_compatible" }) do
 for _, b in ipairs({ false, true }) do enable_buffering = b
 for _, strategy in helpers.each_strategy() do
-  describe("Router [#" .. strategy .. "] with buffering [" .. (b and "on]" or "off]") , function()
+  describe("Router [#" .. strategy .. ", flavor = " .. flavor .. "] with buffering [" .. (b and "on]" or "off]") , function()
     local proxy_client
     local proxy_ssl_client
     local bp
+    local it_trad_only = (flavor == "traditional") and it or pending
 
     lazy_setup(function()
       local fixtures = {
@@ -146,9 +154,11 @@ for _, strategy in helpers.each_strategy() do
       })
 
       assert(helpers.start_kong({
+        router_flavor = flavor,
         database = strategy,
         plugins = "bundled,enable-buffering",
         nginx_conf = "spec/fixtures/custom_nginx.template",
+        stream_listen = string.format("127.0.0.1:%d ssl", stream_tls_listen_port),
       }, nil, nil, fixtures))
     end)
 
@@ -221,7 +231,7 @@ for _, strategy in helpers.each_strategy() do
             },
           },
           {
-            paths      = { [[/users/\d+/profile]] },
+            paths      = { [[~/users/\d+/profile]] },
             protocols  = { "http" },
             strip_path = true,
             service    = {
@@ -233,6 +243,34 @@ for _, strategy in helpers.each_strategy() do
             hosts     = { "serviceless-route-http.test" },
             service   = ngx.null,
           },
+          {
+            paths      = { "/disabled-service1" },
+            protocols  = { "http" },
+            strip_path = false,
+            service    = {
+              path     = "/disabled-service-path/",
+              enabled  = false,
+            },
+          },
+          {
+            paths      = { [[~/enabled-service/\w+]] },
+            protocols  = { "http" },
+            strip_path = true,
+            service    = {
+              path     = "/anything/",
+              enabled  = true,
+              name     = "enabled-service",
+            },
+          },
+          {
+            paths     = { "/enabled-service/disabled" },
+            protocols  = { "http" },
+            strip_path = true,
+            service    = {
+              path     = "/some-path/",
+              enabled  = false,
+            },
+          },
         })
         first_service_name = routes[1].service.name
       end)
@@ -242,14 +280,19 @@ for _, strategy in helpers.each_strategy() do
       end)
 
       it("responds 503 if no service found", function()
-        local res = assert(proxy_client:get("/", {
-          headers = {
-            Host = "serviceless-route-http.test",
-          },
-        }))
-        local body = assert.response(res).has_status(503)
-        local json = cjson.decode(body)
+        local res, body
+        helpers.wait_until(function()
+          res = assert(proxy_client:get("/", {
+            headers = {
+              Host = "serviceless-route-http.test",
+            },
+          }))
+          return pcall(function()
+            body = assert.response(res).has_status(503)
+          end)
+        end, 10)
 
+        local json = cjson.decode(body)
         assert.equal("no Service found with those values", json.message)
 
         local res = assert(proxy_ssl_client:get("/", {
@@ -409,13 +452,38 @@ for _, strategy in helpers.each_strategy() do
         assert.equal(routes[5].service.id,   res.headers["kong-service-id"])
         assert.equal(routes[5].service.name, res.headers["kong-service-name"])
       end)
+
+      describe('handles not enabled services', function()
+        it('ignores route where service enabled=false', function()
+          local res = assert(proxy_client:send {
+            method  = "GET",
+            path    = "/disabled-service1",
+            headers = { ["kong-debug"] = 1 },
+          })
+
+          assert.res_status(404, res)
+        end)
+
+        it('routes to regex path when longer path service enabled=false', function()
+          local res = assert(proxy_client:send {
+            method  = "GET",
+            path    = "/enabled-service/disabled",
+            headers = { ["kong-debug"] = 1 },
+          })
+
+          assert.res_status(200, res)
+          assert.equal(routes[8].id,           res.headers["kong-route-id"])
+          assert.equal(routes[8].service.id,   res.headers["kong-service-id"])
+          assert.equal("enabled-service",      res.headers["kong-service-name"])
+        end)
+      end)
     end)
 
     if not enable_buffering then
     describe("use cases #grpc", function()
       local routes
       local service = {
-        url = "grpc://localhost:15002"
+        url = helpers.grpcbin_url,
       }
 
       local proxy_client_grpc
@@ -672,7 +740,7 @@ for _, strategy in helpers.each_strategy() do
           {
             created_at = 1234567890,
             strip_path = true,
-            paths      = { "/status/(re)" },
+            paths      = { "~/status/(re)" },
             service    = {
               name     = "regex_1",
               path     = "/status/200",
@@ -681,7 +749,7 @@ for _, strategy in helpers.each_strategy() do
           {
             created_at = 1234567891,
             strip_path = true,
-            paths      = { "/status/(r)" },
+            paths      = { "~/status/(r)" },
             service    = {
               name     = "regex_2",
               path     = "/status/200",
@@ -703,7 +771,7 @@ for _, strategy in helpers.each_strategy() do
         remove_routes(strategy, routes)
       end)
 
-      it("depends on created_at field", function()
+      it_trad_only("depends on created_at field", function()
         local res = assert(proxy_client:send {
           method  = "GET",
           path    = "/status/r",
@@ -738,7 +806,7 @@ for _, strategy in helpers.each_strategy() do
 
           {
             strip_path = true,
-            paths      = { "/status/(?<foo>re)" },
+            paths      = { "~/status/(?P<foo>re)" },
             service    = {
               name     = "regex_1",
               path     = "/status/200",
@@ -747,7 +815,7 @@ for _, strategy in helpers.each_strategy() do
           },
           {
             strip_path = true,
-            paths      = { "/status/(re)" },
+            paths      = { "~/status/(re)" },
             service    = {
               name     = "regex_2",
               path     = "/status/200",
@@ -760,7 +828,7 @@ for _, strategy in helpers.each_strategy() do
           {
             created_at = 1234567890,
             strip_path = true,
-            paths      = { "/status/(ab)" },
+            paths      = { "~/status/(ab)" },
             service    = {
               name     = "regex_3",
               path     = "/status/200",
@@ -770,7 +838,7 @@ for _, strategy in helpers.each_strategy() do
           {
             created_at = 1234567891,
             strip_path = true,
-            paths      = { "/status/(ab)c?" },
+            paths      = { "~/status/(ab)c?" },
             service    = {
               name     = "regex_4",
               path     = "/status/200",
@@ -794,7 +862,7 @@ for _, strategy in helpers.each_strategy() do
         assert.equal("regex_2", res.headers["kong-service-name"])
       end)
 
-      it("depends on created_at if regex_priority is tie", function()
+      it_trad_only("depends on created_at if regex_priority is tie", function()
         local res = assert(proxy_client:send {
           method  = "GET",
           path    = "/status/ab",
@@ -868,18 +936,22 @@ for _, strategy in helpers.each_strategy() do
       end)
     end)
 
-    describe("percent-encoded URIs", function()
+    describe("URI normalization", function()
       local routes
 
       lazy_setup(function()
         routes = insert_routes(bp, {
           {
             strip_path = true,
-            paths      = { "/endel%C3%B8st" },
+            paths      = { "/foo/bar" },
           },
           {
             strip_path = true,
-            paths      = { "/foo/../bar" },
+            paths      = { "/hello" },
+          },
+          {
+            strip_path = false,
+            paths      = { "/anything/world" },
           },
         })
       end)
@@ -888,32 +960,116 @@ for _, strategy in helpers.each_strategy() do
         remove_routes(strategy, routes)
       end)
 
-      it("routes when [paths] is percent-encoded", function()
+      it("matches against normalized URI with \"..\"", function()
         local res = assert(proxy_client:send {
           method  = "GET",
-          path    = "/endel%C3%B8st",
+          path    = "/foo/a/../bar",
           headers = { ["kong-debug"] = 1 },
         })
 
-        assert.res_status(200, res)
+        local body = assert.res_status(200, res)
+        body = cjson.decode(body)
 
         assert.equal(routes[1].id,           res.headers["kong-route-id"])
         assert.equal(routes[1].service.id,   res.headers["kong-service-id"])
         assert.equal(routes[1].service.name, res.headers["kong-service-name"])
+        assert.equal("/foo/a/../bar", body.headers["x-forwarded-path"])
       end)
 
-      it("matches against non-normalized URI", function()
+      it("matches against normalized URI with \"//\"", function()
         local res = assert(proxy_client:send {
           method  = "GET",
-          path    = "/foo/../bar",
+          path    = "/foo//bar",
           headers = { ["kong-debug"] = 1 },
         })
 
-        assert.res_status(200, res)
+        local body = assert.res_status(200, res)
+        body = cjson.decode(body)
+
+        assert.equal(routes[1].id,           res.headers["kong-route-id"])
+        assert.equal(routes[1].service.id,   res.headers["kong-service-id"])
+        assert.equal(routes[1].service.name, res.headers["kong-service-name"])
+        assert.equal("/foo//bar", body.headers["x-forwarded-path"])
+      end)
+
+      it("matches against normalized URI with \"/./\"", function()
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/foo/./bar",
+          headers = { ["kong-debug"] = 1 },
+        })
+
+        local body = assert.res_status(200, res)
+        body = cjson.decode(body)
+
+        assert.equal(routes[1].id,           res.headers["kong-route-id"])
+        assert.equal(routes[1].service.id,   res.headers["kong-service-id"])
+        assert.equal(routes[1].service.name, res.headers["kong-service-name"])
+        assert.equal("/foo/./bar", body.headers["x-forwarded-path"])
+      end)
+
+      it("matches against normalized URI with percent-encoded characters", function()
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/h%65llo",
+          headers = { ["kong-debug"] = 1 },
+        })
+
+        local body = assert.res_status(200, res)
+        body = cjson.decode(body)
 
         assert.equal(routes[2].id,           res.headers["kong-route-id"])
         assert.equal(routes[2].service.id,   res.headers["kong-service-id"])
         assert.equal(routes[2].service.name, res.headers["kong-service-name"])
+        assert.equal("/h%65llo", body.headers["x-forwarded-path"])
+      end)
+
+      it("proxies normalized URI to upstream with strip_path = true", function()
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/h%65llo/anything/a/../b",
+          headers = { ["kong-debug"] = 1 },
+        })
+
+        local body = assert.res_status(200, res)
+        body = cjson.decode(body)
+
+        assert.equal(routes[2].id,           res.headers["kong-route-id"])
+        assert.equal(routes[2].service.id,   res.headers["kong-service-id"])
+        assert.equal(routes[2].service.name, res.headers["kong-service-name"])
+        assert.equal("/anything/b", body.vars.request_uri)
+      end)
+
+      it("proxies normalized URI to upstream with strip_path = false", function()
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/anything/./a/../wor%6cd/a/../b",
+          headers = { ["kong-debug"] = 1 },
+        })
+
+        local body = assert.res_status(200, res)
+        body = cjson.decode(body)
+
+        assert.equal(routes[3].id,           res.headers["kong-route-id"])
+        assert.equal(routes[3].service.id,   res.headers["kong-service-id"])
+        assert.equal(routes[3].service.name, res.headers["kong-service-name"])
+        assert.equal("/anything/world/b", body.vars.request_uri)
+      end)
+
+      it("re-encode special characters in request uri when proxying to the upstream", function()
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/anything/world/cat%20and%20dog",
+          headers = { ["kong-debug"] = 1 },
+        })
+
+        local body = assert.res_status(200, res)
+        body = cjson.decode(body)
+
+        assert.equal(routes[3].id,           res.headers["kong-route-id"])
+        assert.equal(routes[3].service.id,   res.headers["kong-service-id"])
+        assert.equal(routes[3].service.name, res.headers["kong-service-name"])
+        assert.equal("/anything/world/cat%20and%20dog", body.vars.request_uri)
       end)
     end)
 
@@ -1051,7 +1207,7 @@ for _, strategy in helpers.each_strategy() do
           assert.equal("preserved.com", json.headers.host)
         end)
 
-        it("forwards request Host:Port even if port is default", function()
+        it_trad_only("forwards request Host:Port even if port is default", function()
           local res = assert(proxy_client:send {
             method  = "GET",
             path    = "/get",
@@ -1214,6 +1370,96 @@ for _, strategy in helpers.each_strategy() do
       end)
     end)
 
+    describe("tls_passthrough", function()
+      local routes
+      local proxy_ssl_client
+
+      lazy_setup(function()
+        routes = insert_routes(bp, {
+          {
+            protocols = { "tls_passthrough" },
+            snis = { "www.example.org" },
+            service = {
+              name = "service_behind_www.example.org",
+              host = helpers.mock_upstream_ssl_host,
+              port = helpers.mock_upstream_ssl_port,
+              protocol = "tcp",
+            },
+          },
+          {
+            protocols = { "tls_passthrough" },
+            snis = { "example.org" },
+            service = {
+              name = "service_behind_example.org",
+              host = helpers.mock_upstream_ssl_host,
+              port = helpers.mock_upstream_ssl_port,
+              protocol = "tcp",
+            },
+          },
+        })
+      end)
+
+      lazy_teardown(function()
+        remove_routes(strategy, routes)
+      end)
+
+      after_each(function()
+        if proxy_ssl_client then
+          proxy_ssl_client:close()
+        end
+      end)
+
+      it_trad_only("matches a Route based on its 'snis' attribute", function()
+        -- config propogates to stream subsystems not instantly
+        -- try up to 10 seconds with step of 2 seconds
+        -- in vagrant it takes around 6 seconds
+        helpers.wait_until(function()
+          proxy_ssl_client = helpers.http_client("127.0.0.1", stream_tls_listen_port)
+          local ok = proxy_ssl_client:ssl_handshake(nil, "www.example.org", false) -- explicit no-verify
+          if not ok then
+            proxy_ssl_client:close()
+            return false
+          end
+          return true
+        end, 10, 2)
+
+        local res = assert(proxy_ssl_client:send {
+          method  = "GET",
+          path    = "/status/200",
+          headers = { ["kong-debug"] = 1 },
+        })
+        assert.res_status(200, res)
+
+        res = assert(proxy_ssl_client:send {
+          method  = "GET",
+          path    = "/status/201",
+          headers = { ["kong-debug"] = 1 },
+        })
+        assert.res_status(201, res)
+
+        proxy_ssl_client:close()
+
+        proxy_ssl_client = helpers.http_client("127.0.0.1", stream_tls_listen_port)
+        assert(proxy_ssl_client:ssl_handshake(nil, "example.org", false)) -- explicit no-verify
+
+        local res = assert(proxy_ssl_client:send {
+          method  = "GET",
+          path    = "/status/200",
+          headers = { ["kong-debug"] = 1 },
+        })
+        assert.res_status(200, res)
+
+        res = assert(proxy_ssl_client:send {
+          method  = "GET",
+          path    = "/status/201",
+          headers = { ["kong-debug"] = 1 },
+        })
+        assert.res_status(201, res)
+
+        proxy_ssl_client:close()
+      end)
+    end)
+
     describe("[#headers]", function()
       local routes
 
@@ -1231,17 +1477,21 @@ for _, strategy in helpers.each_strategy() do
           },
         })
 
-        local res = assert(proxy_client:send {
-          method  = "GET",
-          path    = "/",
-          headers = {
-            ["Host"]       = "domain.org",
-            ["version"]    = "v1",
-            ["kong-debug"] = 1,
-          }
-        })
-
-        assert.res_status(200, res)
+        local res
+        helpers.wait_until(function()
+          res = assert(proxy_client:send {
+            method  = "GET",
+            path    = "/",
+            headers = {
+              ["Host"]       = "domain.org",
+              ["version"]    = "v1",
+              ["kong-debug"] = 1,
+            }
+          })
+          return pcall(function()
+            assert.res_status(200, res)
+          end)
+        end, 10)
 
         assert.equal(routes[1].id,           res.headers["kong-route-id"])
         assert.equal(routes[1].service.id,   res.headers["kong-service-id"])
@@ -1274,15 +1524,23 @@ for _, strategy in helpers.each_strategy() do
           },
         })
 
-        local res = assert(proxy_client:send {
-          method  = "GET",
-          path    = "/",
-          headers = {
-            ["Host"]       = "domain.org",
-            ["version"]    = "v1",
-            ["kong-debug"] = 1,
-          }
-        })
+        local res
+        helpers.wait_until(function()
+          res = assert(proxy_client:send {
+            method  = "GET",
+            path    = "/",
+            headers = {
+              ["Host"]       = "domain.org",
+              ["version"]    = "v1",
+              ["kong-debug"] = 1,
+            }
+          })
+
+          return pcall(function()
+            assert.res_status(200, res)
+            assert.equal(routes[1].id, res.headers["kong-route-id"])
+          end)
+        end, 10)
 
         assert.res_status(200, res)
 
@@ -1327,16 +1585,20 @@ for _, strategy in helpers.each_strategy() do
           },
         })
 
-        local res = assert(proxy_client:send {
-          method  = "GET",
-          path    = "/",
-          headers = {
-            ["Host"]       = "domain.org",
-            ["version"]    = "v3",
-            ["location"]   = "us-east",
-            ["kong-debug"] = 1,
-          }
-        })
+        local res
+        helpers.wait_until(function()
+          res = assert(proxy_client:send {
+            method  = "GET",
+            path    = "/",
+            headers = {
+              ["Host"]       = "domain.org",
+              ["version"]    = "v3",
+              ["location"]   = "us-east",
+              ["kong-debug"] = 1,
+            }
+          })
+          return res.headers["kong-route-id"] == routes[2].id
+        end, 5)
 
         assert.res_status(200, res)
 
@@ -1380,17 +1642,22 @@ for _, strategy in helpers.each_strategy() do
           },
         })
 
-        local res = assert(proxy_client:send {
-          method  = "GET",
-          path    = routes[1].paths[1],
-          headers = {
-            ["Host"]       = routes[1].hosts[1],
-            ["headertest"] = "itsatest",
-            ["kong-debug"] = 1,
-          }
-        })
+        local res
+        helpers.wait_until(function()
+          res = assert(proxy_client:send {
+            method  = "GET",
+            path    = routes[1].paths[1],
+            headers = {
+              ["Host"]       = routes[1].hosts[1],
+              ["headertest"] = "itsatest",
+              ["kong-debug"] = 1,
+            }
+          })
+          return pcall(function()
+            assert.res_status(200, res)
+          end)
+        end, 10)
 
-        assert.res_status(200, res)
         assert.equal(routes[1].id,           res.headers["kong-route-id"])
         assert.equal(routes[1].service.id,   res.headers["kong-service-id"])
         assert.equal(routes[1].service.name, res.headers["kong-service-name"])
@@ -1509,7 +1776,7 @@ for _, strategy in helpers.each_strategy() do
             snis = { "grpcs_1.test" },
             service = {
               name = "grpcs_1",
-              url = "grpcs://localhost:15003",
+              url = helpers.grpcbin_ssl_url,
             },
           },
           {
@@ -1517,7 +1784,7 @@ for _, strategy in helpers.each_strategy() do
             snis = { "grpcs_2.test" },
             service = {
               name = "grpcs_2",
-              url = "grpcs://localhost:15003",
+              url = helpers.grpcbin_ssl_url,
             },
           },
         })
@@ -1670,7 +1937,7 @@ for _, strategy in helpers.each_strategy() do
         remove_routes(strategy, routes)
       end)
 
-      it("regression test for #5438", function()
+      it_trad_only("regression test for #5438", function()
         for i = 1, 9 do
           for j = 1, #routes[i].paths do
             local res = assert(proxy_client:send {
@@ -1692,7 +1959,7 @@ for _, strategy in helpers.each_strategy() do
         end
       end)
 
-      it("regression test for #5438 concatenating paths", function()
+      it_trad_only("regression test for #5438 concatenating paths", function()
         for i = 10, 14 do
           for j = 1, #routes[i].paths do
             local res = assert(proxy_client:send {
@@ -1714,7 +1981,7 @@ for _, strategy in helpers.each_strategy() do
         end
       end)
 
-      it("regression test for #5438 part 2", function()
+      it_trad_only("regression test for #5438 part 2", function()
         local res = assert(proxy_client:send {
           method  = "GET",
           path    = "/rest/devportal",
@@ -1731,7 +1998,7 @@ for _, strategy in helpers.each_strategy() do
         assert.equal(routes[9].service.name, res.headers["kong-service-name"])
       end)
 
-      it("prioritizes longer URIs", function()
+      it_trad_only("prioritizes longer URIs", function()
         local res = assert(proxy_client:send {
           method  = "GET",
           path    = "/root/fixture/get",
@@ -1801,7 +2068,7 @@ for _, strategy in helpers.each_strategy() do
         remove_routes(strategy, routes)
       end)
 
-      it("prioritizes longer URIs", function()
+      it_trad_only("prioritizes longer URIs", function()
         local res = assert(proxy_client:send {
           method  = "GET",
           path    = "/root/fixture/get",
@@ -1828,16 +2095,18 @@ for _, strategy in helpers.each_strategy() do
 
           for i, line in ipairs(path_handling_tests) do
             for j, test in ipairs(line:expand()) do
-              routes[#routes + 1] = {
-                strip_path   = test.strip_path,
-                path_handling = test.path_handling,
-                paths        = test.route_path and { test.route_path } or nil,
-                hosts        = { "localbin-" .. i .. "-" .. j .. ".com" },
-                service = {
-                  name = "plain_" .. i .. "-" .. j,
-                  path = test.service_path,
+              if flavor == "traditional" or test.path_handling == "v0" then
+                routes[#routes + 1] = {
+                  strip_path   = test.strip_path,
+                  path_handling = test.path_handling,
+                  paths        = test.route_path and { test.route_path } or nil,
+                  hosts        = { "localbin-" .. i .. "-" .. j .. ".com" },
+                  service = {
+                    name = "plain_" .. i .. "-" .. j,
+                    path = test.service_path,
+                  }
                 }
-              }
+              end
             end
           end
 
@@ -1852,34 +2121,40 @@ for _, strategy in helpers.each_strategy() do
 
         for i, line in ipairs(path_handling_tests) do
           for j, test in ipairs(line:expand()) do
-            local strip = test.strip_path and "on" or "off"
-            local route_uri_or_host
-            if test.route_path then
-              route_uri_or_host = "uri " .. test.route_path
-            else
-              route_uri_or_host = "host localbin-" .. i .. "-" .. j .. ".com"
+            if flavor == "traditional" or test.path_handling == "v0" then
+              local strip = test.strip_path and "on" or "off"
+              local route_uri_or_host
+              if test.route_path then
+                route_uri_or_host = "uri " .. test.route_path
+              else
+                route_uri_or_host = "host localbin-" .. i .. "-" .. j .. ".com"
+              end
+
+              local description = string.format("(%d-%d) %s with %s, strip = %s, %s when requesting %s",
+                i, j, test.service_path, route_uri_or_host, strip, test.path_handling, test.request_path)
+
+              it(description, function()
+                helpers.wait_until(function()
+                  local res = assert(proxy_client:get(test.request_path, {
+                    headers = {
+                      ["Host"] = "localbin-" .. i .. "-" .. j .. ".com",
+                    }
+                  }))
+
+                  return pcall(function()
+                    local data = assert.response(res).has.jsonbody()
+                    assert.equal(test.expected_path, data.vars.request_uri)
+                  end)
+                end, 10)
+              end)
             end
-
-            local description = string.format("(%d-%d) %s with %s, strip = %s, %s when requesting %s",
-              i, j, test.service_path, route_uri_or_host, strip, test.path_handling, test.request_path)
-
-            it(description, function()
-              local res = assert(proxy_client:get(test.request_path, {
-                headers = {
-                  ["Host"] = "localbin-" .. i .. "-" .. j .. ".com",
-                }
-              }))
-
-              local data = assert.response(res).has.jsonbody()
-              assert.equal(test.expected_path, data.vars.request_uri)
-            end)
           end
         end
       end)
 
       describe("(regex)", function()
         local function make_a_regex(path)
-          return "/[0]?" .. path:sub(2, -1)
+          return "~/[0]?" .. path:sub(2, -1)
         end
 
         local routes
@@ -1890,16 +2165,18 @@ for _, strategy in helpers.each_strategy() do
           for i, line in ipairs(path_handling_tests) do
             if line.route_path then  -- skip if hostbased match
               for j, test in ipairs(line:expand()) do
-                routes[#routes + 1] = {
-                  strip_path   = test.strip_path,
-                  paths        = test.route_path and { make_a_regex(test.route_path) } or nil,
-                  path_handling = test.path_handling,
-                  hosts        = { "localbin-" .. i .. "-" .. j .. ".com" },
-                  service = {
-                    name = "make_regex_" .. i .. "-" .. j,
-                    path = test.service_path,
+                if flavor == "traditional" or test.path_handling == "v0" then
+                  routes[#routes + 1] = {
+                    strip_path   = test.strip_path,
+                    paths        = test.route_path and { make_a_regex(test.route_path) } or nil,
+                    path_handling = test.path_handling,
+                    hosts        = { "localbin-" .. i .. "-" .. j .. ".com" },
+                    service = {
+                      name = "make_regex_" .. i .. "-" .. j,
+                      path = test.service_path,
+                    }
                   }
-                }
+                end
               end
             end
           end
@@ -1914,19 +2191,22 @@ for _, strategy in helpers.each_strategy() do
         for i, line in ipairs(path_handling_tests) do
           if line.route_path then  -- skip if hostbased match
             for j, test in ipairs(line:expand()) do
-              local strip = test.strip_path and "on" or "off"
+              if flavor == "traditional" or test.path_handling == "v0" then
+                local strip = test.strip_path and "on" or "off"
 
-              local description = string.format("(%d-%d) %s with uri %s, strip = %s, %s when requesting %s",
-                i, j, test.service_path, make_a_regex(test.route_path), strip, test.path_handling, test.request_path)
+                local description = string.format("(%d-%d) %s with uri %s, strip = %s, %s when requesting %s",
+                  i, j, test.service_path, make_a_regex(test.route_path), strip, test.path_handling, test.request_path)
 
-              it(description, function()
-                local res = assert(proxy_client:get(test.request_path, {
-                  headers = { Host = "localbin-" .. i .. "-" .. j .. ".com" },
-                }))
+                it(description, function()
+                  local res = assert(proxy_client:get(test.request_path, {
+                    headers = { Host = "localbin-" .. i .. "-" .. j .. ".com" },
+                  }))
 
-                local data = assert.response(res).has.jsonbody()
-                assert.equal(test.expected_path, data.vars.request_uri)
-              end)
+                  local data = assert.response(res).has.jsonbody()
+                  assert.truthy(data.vars)
+                  assert.equal(test.expected_path, data.vars.request_uri)
+                end)
+              end
             end
           end
         end
@@ -1963,7 +2243,7 @@ for _, strategy in helpers.each_strategy() do
     end)
   end)
 
-  describe("Router at startup [#" .. strategy .. "]" , function()
+  describe("Router [#" .. strategy .. ", flavor = " .. flavor .. "] at startup" , function()
     local proxy_client
     local route
 
@@ -1990,6 +2270,7 @@ for _, strategy in helpers.each_strategy() do
       end
 
       assert(helpers.start_kong({
+        router_flavor = flavor,
         database = strategy,
         nginx_worker_processes = 4,
         plugins = "bundled,enable-buffering",
@@ -2027,6 +2308,74 @@ for _, strategy in helpers.each_strategy() do
       end
     end)
 
+    it("#db worker respawn correctly rebuilds router", function()
+      local admin_client = helpers.admin_client()
+
+      local res = assert(admin_client:post("/routes", {
+        headers = { ["Content-Type"] = "application/json" },
+        body = {
+          paths = { "/foo" },
+        },
+      }))
+      assert.res_status(201, res)
+      admin_client:close()
+
+      assert(helpers.signal_workers(nil, "-TERM"))
+
+      proxy_client:close()
+      proxy_client = helpers.proxy_client()
+
+      local res = assert(proxy_client:send {
+        method  = "GET",
+        path    = "/foo",
+        headers = { ["kong-debug"] = 1 },
+      })
+
+      local body = assert.response(res).has_status(503)
+      local json = cjson.decode(body)
+      assert.equal("no Service found with those values", json.message)
+    end)
+
+    it("#db rebuilds router correctly after passing invalid route", function()
+      local admin_client = helpers.admin_client()
+
+      local res = assert(admin_client:post("/routes", {
+        headers = { ["Content-Type"] = "application/json" },
+        body = {
+          -- this is a invalid regex path
+          paths = { "~/delay/(?<delay>[^\\/]+)$", },
+        },
+      }))
+      assert.res_status(201, res)
+
+      helpers.wait_for_all_config_update()
+
+      local res = assert(admin_client:post("/routes", {
+        headers = { ["Content-Type"] = "application/json" },
+        body = {
+          paths = { "/foo" },
+        },
+      }))
+      assert.res_status(201, res)
+
+      admin_client:close()
+
+      helpers.wait_for_all_config_update()
+
+      proxy_client:close()
+      proxy_client = helpers.proxy_client()
+
+      local res = assert(proxy_client:send {
+        method  = "GET",
+        path    = "/foo",
+        headers = { ["kong-debug"] = 1 },
+      })
+
+      local body = assert.response(res).has_status(503)
+      local json = cjson.decode(body)
+      assert.equal("no Service found with those values", json.message)
+    end)
   end)
+end
 end
 end

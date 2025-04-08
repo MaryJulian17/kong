@@ -1,4 +1,5 @@
 local statsd_logger = require "kong.plugins.datadog.statsd_logger"
+local kong_meta = require "kong.meta"
 
 
 local kong     = kong
@@ -22,16 +23,22 @@ local get_consumer_id = {
 }
 
 
-local function compose_tags(service_name, status, consumer_id, tags)
-  local result = {"name:" ..service_name, "status:"..status}
+local function compose_tags(service_name, status, consumer_id, tags, conf)
+  local result = {
+    (conf.service_name_tag or "name") .. ":" .. service_name,
+    (conf.status_tag or "status") .. ":" .. status
+  }
+
   if consumer_id ~= nil then
-    insert(result, "consumer:" ..consumer_id)
+    insert(result, (conf.consumer_tag or "consumer") .. ":" .. consumer_id)
   end
+
   if tags ~= nil then
     for _, v in pairs(tags) do
       insert(result, v)
     end
   end
+
   return result
 end
 
@@ -54,8 +61,8 @@ local function log(premature, conf, message)
     request_count    = "request.count",
   }
   local stat_value = {
-    request_size     = message.request.size,
-    response_size    = message.response.size,
+    request_size     = message.request and message.request.size,
+    response_size    = message.response and message.response.size,
     latency          = message.latencies.request,
     upstream_latency = message.latencies.proxy,
     kong_latency     = message.latencies.kong,
@@ -73,7 +80,9 @@ local function log(premature, conf, message)
     local stat_value      = stat_value[metric_config.name]
     local get_consumer_id = get_consumer_id[metric_config.consumer_identifier]
     local consumer_id     = get_consumer_id and get_consumer_id(message.consumer) or nil
-    local tags            = compose_tags(name, message.response.status, consumer_id, metric_config.tags)
+    local tags            = compose_tags(
+            name, message.response and message.response.status or "-",
+            consumer_id, metric_config.tags, conf)
 
     if stat_name ~= nil then
       logger:send_statsd(stat_name, stat_value,
@@ -87,7 +96,7 @@ end
 
 local DatadogHandler = {
   PRIORITY = 10,
-  VERSION = "3.0.1",
+  VERSION = kong_meta.version,
 }
 
 

@@ -1,4 +1,9 @@
+local require = require
+
+
 local kong_default_conf = require "kong.templates.kong_defaults"
+local process_secrets = require "kong.cmd.utils.process_secrets"
+local openssl_pkey = require "resty.openssl.pkey"
 local pl_stringio = require "pl.stringio"
 local pl_stringx = require "pl.stringx"
 local constants = require "kong.constants"
@@ -11,11 +16,54 @@ local tablex = require "pl.tablex"
 local utils = require "kong.tools.utils"
 local log = require "kong.cmd.utils.log"
 local env = require "kong.cmd.utils.env"
-local ip = require "resty.mediador.ip"
+local ffi = require "ffi"
 
 
 local fmt = string.format
+local sub = string.sub
+local type = type
+local sort = table.sort
+local find = string.find
+local gsub = string.gsub
+local strip = pl_stringx.strip
+local floor = math.floor
+local lower = string.lower
+local upper = string.upper
+local match = string.match
+local pairs = pairs
+local assert = assert
+local unpack = unpack
+local ipairs = ipairs
+local insert = table.insert
+local remove = table.remove
 local concat = table.concat
+local getenv = os.getenv
+local exists = pl_path.exists
+local abspath = pl_path.abspath
+local tostring = tostring
+local tonumber = tonumber
+local setmetatable = setmetatable
+
+
+local get_phase do
+  if ngx and ngx.get_phase then
+    get_phase = ngx.get_phase
+  else
+    get_phase = function()
+      return "timer"
+    end
+  end
+end
+
+
+local C = ffi.C
+
+
+ffi.cdef([[
+  struct group *getgrnam(const char *name);
+  struct passwd *getpwnam(const char *name);
+  int unsetenv(const char *name);
+]])
 
 
 -- Version 5: https://wiki.mozilla.org/Security/Server_Side_TLS
@@ -35,6 +83,7 @@ local cipher_suites = {
                          .. "ECDHE-RSA-CHACHA20-POLY1305:"
                          .. "DHE-RSA-AES128-GCM-SHA256:"
                          .. "DHE-RSA-AES256-GCM-SHA384",
+                 dhparams = "ffdhe2048",
     prefer_server_ciphers = "off",
   },
                       old = {
@@ -66,6 +115,18 @@ local cipher_suites = {
                          .. "AES256-SHA:"
                          .. "DES-CBC3-SHA",
     prefer_server_ciphers = "on",
+  },
+                     fips = { -- https://wiki.openssl.org/index.php/FIPS_mode_and_TLS
+                          -- TLSv1.0 and TLSv1.1 is not completely not FIPS compliant,
+                          -- but must be used under certain condititions like key sizes,
+                          -- signatures in the full chain that Kong can't control.
+                          -- In that case, we disables TLSv1.0 and TLSv1.1 and user
+                          -- can optionally turn them on if they are aware of the caveats.
+                          -- No FIPS compliant predefined DH group available prior to
+                          -- OpenSSL 3.0.
+                protocols = "TLSv1.2",
+                  ciphers = "TLSv1.2+FIPS:kRSA+FIPS:!eNULL:!aNULL",
+    prefer_server_ciphers = "on",
   }
 }
 
@@ -80,13 +141,13 @@ local HEADERS = constants.HEADERS
 local HEADER_KEY_TO_NAME = {
   ["server_tokens"] = "server_tokens",
   ["latency_tokens"] = "latency_tokens",
-  [string.lower(HEADERS.VIA)] = HEADERS.VIA,
-  [string.lower(HEADERS.SERVER)] = HEADERS.SERVER,
-  [string.lower(HEADERS.PROXY_LATENCY)] = HEADERS.PROXY_LATENCY,
-  [string.lower(HEADERS.RESPONSE_LATENCY)] = HEADERS.RESPONSE_LATENCY,
-  [string.lower(HEADERS.ADMIN_LATENCY)] = HEADERS.ADMIN_LATENCY,
-  [string.lower(HEADERS.UPSTREAM_LATENCY)] = HEADERS.UPSTREAM_LATENCY,
-  [string.lower(HEADERS.UPSTREAM_STATUS)] = HEADERS.UPSTREAM_STATUS,
+  [lower(HEADERS.VIA)] = HEADERS.VIA,
+  [lower(HEADERS.SERVER)] = HEADERS.SERVER,
+  [lower(HEADERS.PROXY_LATENCY)] = HEADERS.PROXY_LATENCY,
+  [lower(HEADERS.RESPONSE_LATENCY)] = HEADERS.RESPONSE_LATENCY,
+  [lower(HEADERS.ADMIN_LATENCY)] = HEADERS.ADMIN_LATENCY,
+  [lower(HEADERS.UPSTREAM_LATENCY)] = HEADERS.UPSTREAM_LATENCY,
+  [lower(HEADERS.UPSTREAM_STATUS)] = HEADERS.UPSTREAM_STATUS,
 }
 
 
@@ -149,19 +210,18 @@ local DYNAMIC_KEY_NAMESPACES = {
     prefix = "nginx_sproxy_",
     ignore = EMPTY,
   },
+  {
+    prefix = "pluginserver_",
+    ignore = EMPTY,
+  },
+  {
+    prefix = "vault_",
+    ignore = EMPTY,
+  },
 }
 
 
-local DEPRECATED_DYNAMIC_KEY_NAMESPACES = {
-  {
-    injected_conf_name = "nginx_upstream_directives",
-    previous_conf_name = "nginx_http_upstream_directives",
-  },
-  {
-    injected_conf_name = "nginx_status_directives",
-    previous_conf_name = "nginx_http_status_directives",
-  },
-}
+local DEPRECATED_DYNAMIC_KEY_NAMESPACES = {}
 
 
 local PREFIX_PATHS = {
@@ -174,80 +234,38 @@ local PREFIX_PATHS = {
   nginx_kong_stream_conf = {"nginx-kong-stream.conf"},
 
   kong_env = {".kong_env"},
+  kong_process_secrets = {".kong_process_secrets"},
 
+  ssl_cert_csr_default = {"ssl", "kong-default.csr"},
   ssl_cert_default = {"ssl", "kong-default.crt"},
   ssl_cert_key_default = {"ssl", "kong-default.key"},
-  ssl_cert_csr_default = {"ssl", "kong-default.csr"},
+  ssl_cert_default_ecdsa = {"ssl", "kong-default-ecdsa.crt"},
+  ssl_cert_key_default_ecdsa = {"ssl", "kong-default-ecdsa.key"},
 
   client_ssl_cert_default = {"ssl", "kong-default.crt"},
   client_ssl_cert_key_default = {"ssl", "kong-default.key"},
 
   admin_ssl_cert_default = {"ssl", "admin-kong-default.crt"},
   admin_ssl_cert_key_default = {"ssl", "admin-kong-default.key"},
+  admin_ssl_cert_default_ecdsa = {"ssl", "admin-kong-default-ecdsa.crt"},
+  admin_ssl_cert_key_default_ecdsa = {"ssl", "admin-kong-default-ecdsa.key"},
 
   status_ssl_cert_default = {"ssl", "status-kong-default.crt"},
   status_ssl_cert_key_default = {"ssl", "status-kong-default.key"},
+  status_ssl_cert_default_ecdsa = {"ssl", "status-kong-default-ecdsa.crt"},
+  status_ssl_cert_key_default_ecdsa = {"ssl", "status-kong-default-ecdsa.key"},
 }
 
 
-local function upstream_keepalive_deprecated_properties(conf)
-  -- nginx_http_upstream_keepalive -> nginx_upstream_keepalive
-  if conf.nginx_upstream_keepalive == nil then
-    if conf.nginx_http_upstream_keepalive ~= nil then
-      conf.nginx_upstream_keepalive = conf.nginx_http_upstream_keepalive
-    end
+local function is_predefined_dhgroup(group)
+  if type(group) ~= "string" then
+    return false
   end
 
-  -- upstream_keepalive -> nginx_upstream_keepalive + nginx_http_upstream_keepalive
-  if conf.nginx_upstream_keepalive == nil then
-    if conf.upstream_keepalive ~= nil then
-      if conf.upstream_keepalive == 0 then
-        conf.nginx_upstream_keepalive = "NONE"
-        conf.nginx_http_upstream_keepalive = "NONE"
-
-      else
-        conf.nginx_upstream_keepalive = tostring(conf.upstream_keepalive)
-        conf.nginx_http_upstream_keepalive = tostring(conf.upstream_keepalive)
-      end
-    end
-  end
-
-  -- nginx_upstream_keepalive -> upstream_keepalive_pool_size
-  if conf.upstream_keepalive_pool_size == nil then
-    if conf.nginx_upstream_keepalive ~= nil then
-      if conf.nginx_upstream_keepalive == "NONE" then
-        conf.upstream_keepalive_pool_size = 0
-
-      else
-        conf.upstream_keepalive_pool_size = tonumber(conf.nginx_upstream_keepalive)
-      end
-    end
-  end
-
-  -- nginx_http_upstream_keepalive_requests -> nginx_upstream_keepalive_requests
-  if conf.nginx_upstream_keepalive_requests == nil then
-    conf.nginx_upstream_keepalive_requests = conf.nginx_http_upstream_keepalive_requests
-  end
-
-  -- nginx_upstream_keepalive_requests -> upstream_keepalive_max_requests
-  if conf.upstream_keepalive_max_requests == nil
-     and conf.nginx_upstream_keepalive_requests ~= nil
-  then
-    conf.upstream_keepalive_max_requests = tonumber(conf.nginx_upstream_keepalive_requests)
-  end
-
-  -- nginx_http_upstream_keepalive_timeout -> nginx_upstream_keepalive_timeout
-  if conf.nginx_upstream_keepalive_timeout == nil then
-    conf.nginx_upstream_keepalive_timeout = conf.nginx_http_upstream_keepalive_timeout
-  end
-  --
-  -- nginx_upstream_keepalive_timeout -> upstream_keepalive_idle_timeout
-  if conf.upstream_keepalive_idle_timeout == nil
-     and conf.nginx_upstream_keepalive_timeout ~= nil
-  then
-    conf.upstream_keepalive_idle_timeout =
-      utils.nginx_conf_time_to_seconds(conf.nginx_upstream_keepalive_timeout)
-  end
+  return not not openssl_pkey.paramgen({
+    type = "DH",
+    group = group,
+  })
 end
 
 
@@ -270,6 +288,12 @@ local CONF_INFERENCES = {
   status_listen = { typ = "array" },
   stream_listen = { typ = "array" },
   cluster_listen = { typ = "array" },
+  ssl_cert = { typ = "array" },
+  ssl_cert_key = { typ = "array" },
+  admin_ssl_cert = { typ = "array" },
+  admin_ssl_cert_key = { typ = "array" },
+  status_ssl_cert = { typ = "array" },
+  status_ssl_cert_key = { typ = "array" },
   db_update_frequency = {  typ = "number"  },
   db_update_propagation = {  typ = "number"  },
   db_cache_ttl = {  typ = "number"  },
@@ -295,61 +319,6 @@ local CONF_INFERENCES = {
     },
   },
 
-  -- TODO: remove since deprecated in 1.3
-  upstream_keepalive = {
-    typ = "number",
-    deprecated = {
-      replacement = "upstream_keepalive_pool_size",
-      alias = upstream_keepalive_deprecated_properties,
-    }
-  },
-
-  -- TODO: remove since deprecated in 2.0
-  nginx_http_upstream_keepalive = {
-    typ = "string",
-    deprecated = {
-      replacement = "upstream_keepalive_pool_size",
-      alias = upstream_keepalive_deprecated_properties,
-    }
-  },
-  nginx_http_upstream_keepalive_requests = {
-    typ = "string",
-    deprecated = {
-      replacement = "upstream_keepalive_max_requests",
-      alias = upstream_keepalive_deprecated_properties,
-    }
-  },
-  nginx_http_upstream_keepalive_timeout = {
-    typ = "string",
-    deprecated = {
-      replacement = "upstream_keepalive_idle_timeout",
-      alias = upstream_keepalive_deprecated_properties,
-    }
-  },
-
-  -- TODO: remove since deprecated in 2.1
-  nginx_upstream_keepalive = {
-    typ = "string",
-    deprecated = {
-      replacement = "upstream_keepalive_pool_size",
-      alias = upstream_keepalive_deprecated_properties,
-    }
-  },
-  nginx_upstream_keepalive_requests = {
-    typ = "string",
-    deprecated = {
-      replacement = "upstream_keepalive_max_requests",
-      alias = upstream_keepalive_deprecated_properties,
-    }
-  },
-  nginx_upstream_keepalive_timeout = {
-    typ = "string",
-    deprecated = {
-      replacement = "upstream_keepalive_idle_timeout",
-      alias = upstream_keepalive_deprecated_properties,
-    }
-  },
-
   upstream_keepalive_pool_size = { typ = "number" },
   upstream_keepalive_max_requests = { typ = "number" },
   upstream_keepalive_idle_timeout = { typ = "number" },
@@ -366,28 +335,6 @@ local CONF_INFERENCES = {
     typ = "ngx_boolean",
     alias = {
       replacement = "nginx_proxy_real_ip_recursive",
-    }
-  },
-  client_max_body_size = {
-    typ = "string",
-    deprecated = {
-      replacement = "nginx_http_client_max_body_size",
-      alias = function(conf)
-        if conf.nginx_http_client_max_body_size == nil then
-          conf.nginx_http_client_max_body_size = conf.client_max_body_size
-        end
-      end,
-    }
-  },
-  client_body_buffer_size = {
-    typ = "string",
-    deprecated = {
-      replacement = "nginx_http_client_body_buffer_size",
-      alias = function(conf)
-        if conf.nginx_http_client_body_buffer_size == nil then
-          conf.nginx_http_client_body_buffer_size = conf.client_body_buffer_size
-        end
-      end,
     }
   },
   error_default_type = { enum = {
@@ -443,21 +390,6 @@ local CONF_INFERENCES = {
                                   "LOCAL_ONE",
                                 }
                               },
-  cassandra_consistency = {
-    typ = "string",
-    deprecated = {
-      replacement = "cassandra_write_consistency / cassandra_read_consistency",
-      alias = function(conf)
-        if conf.cassandra_write_consistency == nil then
-          conf.cassandra_write_consistency = conf.cassandra_consistency
-        end
-
-        if conf.cassandra_read_consistency == nil then
-          conf.cassandra_read_consistency = conf.cassandra_consistency
-        end
-      end,
-    }
-  },
   cassandra_lb_policy = { enum = {
                             "RoundRobin",
                             "RequestRoundRobin",
@@ -481,10 +413,16 @@ local CONF_INFERENCES = {
   dns_order = { typ = "array" },
   dns_valid_ttl = { typ = "number" },
   dns_stale_ttl = { typ = "number" },
+  dns_cache_size = { typ = "number" },
   dns_not_found_ttl = { typ = "number" },
   dns_error_ttl = { typ = "number" },
   dns_no_sync = { typ = "boolean" },
-  worker_consistency = { enum = { "strict", "eventual" } },
+  worker_consistency = { enum = { "strict", "eventual" },
+    -- deprecating values for enums
+    deprecated = {
+      value = "strict",
+     }
+  },
   router_consistency = {
     enum = { "strict", "eventual" },
     deprecated = {
@@ -497,19 +435,10 @@ local CONF_INFERENCES = {
       end,
     }
   },
-  worker_state_update_frequency = { typ = "number" },
-  router_update_frequency = {
-    typ = "number",
-    deprecated = {
-      replacement = "worker_state_update_frequency",
-      alias = function(conf)
-        if conf.worker_state_update_frequency == nil and
-           conf.router_update_frequency ~= nil then
-          conf.worker_state_update_frequency = conf.router_update_frequency
-        end
-      end,
-    }
+  router_flavor = {
+    enum = { "traditional", "traditional_compatible", "expressions" },
   },
+  worker_state_update_frequency = { typ = "number" },
 
   ssl_protocols = {
     typ = "string",
@@ -523,6 +452,13 @@ local CONF_INFERENCES = {
     directives = {
       "nginx_http_ssl_prefer_server_ciphers",
       "nginx_stream_ssl_prefer_server_ciphers",
+    },
+  },
+  ssl_dhparam = {
+    typ = "string",
+    directives = {
+      "nginx_http_ssl_dhparam",
+      "nginx_stream_ssl_dhparam",
     },
   },
   ssl_session_tickets = {
@@ -544,6 +480,8 @@ local CONF_INFERENCES = {
 
   proxy_access_log = { typ = "string" },
   proxy_error_log = { typ = "string" },
+  proxy_stream_access_log = { typ = "string" },
+  proxy_stream_error_log = { typ = "string" },
   admin_access_log = { typ = "string" },
   admin_error_log = { typ = "string" },
   status_access_log = { typ = "string" },
@@ -559,14 +497,19 @@ local CONF_INFERENCES = {
                   "emerg",
                 }
               },
+  vaults = { typ = "array" },
   plugins = { typ = "array" },
   anonymous_reports = { typ = "boolean" },
-  nginx_optimizations = {
-    typ = "boolean",
-    deprecated = { replacement = false }
-  },
 
+  lua_ssl_trusted_certificate = { typ = "array" },
   lua_ssl_verify_depth = { typ = "number" },
+  lua_ssl_protocols = {
+    typ = "string",
+    directives = {
+      "nginx_http_lua_ssl_protocols",
+      "nginx_stream_lua_ssl_protocols",
+    },
+  },
   lua_socket_pool_size = { typ = "number" },
 
   role = { enum = { "data_plane", "control_plane", "traditional", }, },
@@ -576,7 +519,27 @@ local CONF_INFERENCES = {
   cluster_mtls = { enum = { "shared", "pki" } },
   cluster_ca_cert = { typ = "string" },
   cluster_server_name = { typ = "string" },
+  cluster_data_plane_purge_delay = { typ = "number" },
+  cluster_ocsp = { enum = { "on", "off", "optional" } },
+  cluster_max_payload = { typ = "number" },
+
   kic = { typ = "boolean" },
+  pluginserver_names = { typ = "array" },
+
+  untrusted_lua = { enum = { "on", "off", "sandbox" } },
+  untrusted_lua_sandbox_requires = { typ = "array" },
+  untrusted_lua_sandbox_environment = { typ = "array" },
+
+  legacy_worker_events = { typ = "boolean" },
+  legacy_hybrid_protocol = { typ = "boolean" },
+
+  lmdb_environment_path = { typ = "string" },
+  lmdb_map_size = { typ = "string" },
+
+  opentelemetry_tracing = { typ = "array" },
+  opentelemetry_tracing_sampling_rate = { typ = "number" },
+
+  max_queued_batches = { typ = "number" },
 }
 
 
@@ -612,6 +575,54 @@ local _nop_tostring_mt = {
 }
 
 
+local function infer_value(value, typ, opts)
+  if type(value) == "string" then
+    if not opts.from_kong_env then
+      -- remove trailing comment, if any
+      -- and remove escape chars from octothorpes
+      value = gsub(value, "[^\\]#.-$", "")
+      value = gsub(value, "\\#", "#")
+    end
+
+    value = strip(value)
+  end
+
+  -- transform {boolean} values ("on"/"off" aliasing to true/false)
+  -- transform {ngx_boolean} values ("on"/"off" aliasing to on/off)
+  -- transform {explicit string} values (number values converted to strings)
+  -- transform {array} values (comma-separated strings)
+  if typ == "boolean" then
+    value = value == true or value == "on" or value == "true"
+
+  elseif typ == "ngx_boolean" then
+    value = (value == "on" or value == true) and "on" or "off"
+
+  elseif typ == "string" then
+    value = tostring(value) -- forced string inference
+
+  elseif typ == "number" then
+    value = tonumber(value) -- catch ENV variables (strings) that are numbers
+
+  elseif typ == "array" and type(value) == "string" then
+    -- must check type because pl will already convert comma
+    -- separated strings to tables (but not when the arr has
+    -- only one element)
+    value = setmetatable(pl_stringx.split(value, ","), nil) -- remove List mt
+
+    for i = 1, #value do
+      value[i] = strip(value[i])
+    end
+  end
+
+  if value == "" then
+    -- unset values are removed
+    value = nil
+  end
+
+  return value
+end
+
+
 -- Validate properties (type/enum/custom) and infer their type.
 -- @param[type=table] conf The configuration table to treat.
 local function check_and_infer(conf, opts)
@@ -619,53 +630,10 @@ local function check_and_infer(conf, opts)
 
   for k, value in pairs(conf) do
     local v_schema = CONF_INFERENCES[k] or {}
-    local typ = v_schema.typ
 
-    if type(value) == "string" then
-      if not opts.from_kong_env then
-        -- remove trailing comment, if any
-        -- and remove escape chars from octothorpes
-        value = string.gsub(value, "[^\\]#.-$", "")
-        value = string.gsub(value, "\\#", "#")
-      end
+    value = infer_value(value, v_schema.typ, opts)
 
-      value = pl_stringx.strip(value)
-    end
-
-    -- transform {boolean} values ("on"/"off" aliasing to true/false)
-    -- transform {ngx_boolean} values ("on"/"off" aliasing to on/off)
-    -- transform {explicit string} values (number values converted to strings)
-    -- transform {array} values (comma-separated strings)
-    if typ == "boolean" then
-      value = value == true or value == "on" or value == "true"
-
-    elseif typ == "ngx_boolean" then
-      value = (value == "on" or value == true) and "on" or "off"
-
-    elseif typ == "string" then
-      value = tostring(value) -- forced string inference
-
-    elseif typ == "number" then
-      value = tonumber(value) -- catch ENV variables (strings) that are numbers
-
-    elseif typ == "array" and type(value) == "string" then
-      -- must check type because pl will already convert comma
-      -- separated strings to tables (but not when the arr has
-      -- only one element)
-      value = setmetatable(pl_stringx.split(value, ","), nil) -- remove List mt
-
-      for i = 1, #value do
-        value[i] = pl_stringx.strip(value[i])
-      end
-    end
-
-    if value == "" then
-      -- unset values are removed
-      value = nil
-    end
-
-    typ = typ or "string"
-
+    local typ = v_schema.typ or "string"
     if value and not typ_checks[typ](value) then
       errors[#errors + 1] = fmt("%s is not a %s: '%s'", k, typ,
                                 tostring(value))
@@ -689,14 +657,14 @@ local function check_and_infer(conf, opts)
     local MAX_PORT = 65535
 
     for _, port_map in ipairs(conf.port_maps) do
-      local colpos = string.find(port_map, ":", nil, true)
+      local colpos = find(port_map, ":", nil, true)
       if not colpos then
         errors[#errors + 1] = "invalid port mapping (`port_maps`): " .. port_map
 
       else
-        local host_port_str = string.sub(port_map, 1, colpos - 1)
+        local host_port_str = sub(port_map, 1, colpos - 1)
         local host_port_num = tonumber(host_port_str, 10)
-        local kong_port_str = string.sub(port_map, colpos + 1)
+        local kong_port_str = sub(port_map, colpos + 1)
         local kong_port_num = tonumber(kong_port_str, 10)
 
         if  (host_port_num and host_port_num >= MIN_PORT and host_port_num <= MAX_PORT)
@@ -712,7 +680,13 @@ local function check_and_infer(conf, opts)
   end
 
   if conf.database == "cassandra" then
-    if string.find(conf.cassandra_lb_policy, "DCAware", nil, true)
+    log.deprecation("Support for Cassandra is deprecated. Please refer to " ..
+                    "https://konghq.com/blog/cassandra-support-deprecated", {
+      after   = "2.7",
+      removal = "4.0"
+    })
+
+    if find(conf.cassandra_lb_policy, "DCAware", nil, true)
        and not conf.cassandra_local_datacenter
     then
       errors[#errors + 1] = "must specify 'cassandra_local_datacenter' when " ..
@@ -745,20 +719,50 @@ local function check_and_infer(conf, opts)
     end
   end
 
-  if (concat(conf.proxy_listen, ",") .. " "):find("%sssl[%s,]") then
-    if conf.ssl_cert and not conf.ssl_cert_key then
-      errors[#errors + 1] = "ssl_cert_key must be specified"
+  for _, prefix in ipairs({ "proxy_", "admin_", "status_" }) do
+    local listen = conf[prefix .. "listen"]
 
-    elseif conf.ssl_cert_key and not conf.ssl_cert then
-      errors[#errors + 1] = "ssl_cert must be specified"
+    local ssl_enabled = find(concat(listen, ",") .. " ", "%sssl[%s,]") ~= nil
+    if not ssl_enabled and prefix == "proxy_" then
+      ssl_enabled = find(concat(conf.stream_listen, ",") .. " ", "%sssl[%s,]") ~= nil
     end
 
-    if conf.ssl_cert and not pl_path.exists(conf.ssl_cert) then
-      errors[#errors + 1] = "ssl_cert: no such file at " .. conf.ssl_cert
+    if prefix == "proxy_" then
+      prefix = ""
     end
 
-    if conf.ssl_cert_key and not pl_path.exists(conf.ssl_cert_key) then
-      errors[#errors + 1] = "ssl_cert_key: no such file at " .. conf.ssl_cert_key
+    if ssl_enabled then
+      conf.ssl_enabled = true
+
+      local ssl_cert = conf[prefix .. "ssl_cert"]
+      local ssl_cert_key = conf[prefix .. "ssl_cert_key"]
+
+      if #ssl_cert > 0 and #ssl_cert_key == 0 then
+        errors[#errors + 1] = prefix .. "ssl_cert_key must be specified"
+
+      elseif #ssl_cert_key > 0 and #ssl_cert == 0 then
+        errors[#errors + 1] = prefix .. "ssl_cert must be specified"
+
+      elseif #ssl_cert ~= #ssl_cert_key then
+        errors[#errors + 1] = prefix .. "ssl_cert was specified " .. #ssl_cert .. " times while " ..
+          prefix .. "ssl_cert_key was specified " .. #ssl_cert_key .. " times"
+      end
+
+      if ssl_cert then
+        for _, cert in ipairs(ssl_cert) do
+          if not exists(cert) then
+            errors[#errors + 1] = prefix .. "ssl_cert: no such file at " .. cert
+          end
+        end
+      end
+
+      if ssl_cert_key then
+        for _, cert_key in ipairs(ssl_cert_key) do
+          if not exists(cert_key) then
+            errors[#errors + 1] = prefix .. "ssl_cert_key: no such file at " .. cert_key
+          end
+        end
+      end
     end
   end
 
@@ -770,41 +774,43 @@ local function check_and_infer(conf, opts)
       errors[#errors + 1] = "client_ssl_cert must be specified"
     end
 
-    if conf.client_ssl_cert and not pl_path.exists(conf.client_ssl_cert) then
+    if conf.client_ssl_cert and not exists(conf.client_ssl_cert) then
       errors[#errors + 1] = "client_ssl_cert: no such file at " ..
                           conf.client_ssl_cert
     end
 
-    if conf.client_ssl_cert_key and not pl_path.exists(conf.client_ssl_cert_key) then
+    if conf.client_ssl_cert_key and not exists(conf.client_ssl_cert_key) then
       errors[#errors + 1] = "client_ssl_cert_key: no such file at " ..
                           conf.client_ssl_cert_key
     end
   end
 
-  if (concat(conf.admin_listen, ",") .. " "):find("%sssl[%s,]") then
-    if conf.admin_ssl_cert and not conf.admin_ssl_cert_key then
-      errors[#errors + 1] = "admin_ssl_cert_key must be specified"
+  if conf.lua_ssl_trusted_certificate then
+    local new_paths = {}
 
-    elseif conf.admin_ssl_cert_key and not conf.admin_ssl_cert then
-      errors[#errors + 1] = "admin_ssl_cert must be specified"
+    for _, path in ipairs(conf.lua_ssl_trusted_certificate) do
+      if path == "system" then
+        local system_path, err = utils.get_system_trusted_certs_filepath()
+        if system_path then
+          path = system_path
+
+        elseif not ngx.IS_CLI then
+          log.info("lua_ssl_trusted_certificate: unable to locate system bundle: " .. err ..
+                   ". If you are using TLS connections, consider specifying " ..
+                   "\"lua_ssl_trusted_certificate\" manually")
+        end
+      end
+
+      if path ~= "system" then
+        if not exists(path) then
+          errors[#errors + 1] = "lua_ssl_trusted_certificate: no such file at " .. path
+        end
+
+        new_paths[#new_paths + 1] = path
+      end
     end
 
-    if conf.admin_ssl_cert and not pl_path.exists(conf.admin_ssl_cert) then
-      errors[#errors + 1] = "admin_ssl_cert: no such file at " ..
-                          conf.admin_ssl_cert
-    end
-
-    if conf.admin_ssl_cert_key and not pl_path.exists(conf.admin_ssl_cert_key) then
-      errors[#errors + 1] = "admin_ssl_cert_key: no such file at " ..
-                          conf.admin_ssl_cert_key
-    end
-  end
-
-  if conf.lua_ssl_trusted_certificate and
-     not pl_path.exists(conf.lua_ssl_trusted_certificate)
-  then
-    errors[#errors + 1] = "lua_ssl_trusted_certificate: no such file at " ..
-                        conf.lua_ssl_trusted_certificate
+    conf.lua_ssl_trusted_certificate = new_paths
   end
 
   if conf.ssl_cipher_suite ~= "custom" then
@@ -816,14 +822,37 @@ local function check_and_infer(conf, opts)
       conf.nginx_stream_ssl_protocols = suite.protocols
       conf.nginx_stream_ssl_prefer_server_ciphers = suite.prefer_server_ciphers
 
+      -- There is no secure predefined one for old at the moment (and it's too slow to generate one).
+      -- Intermediate (the default) forcibly sets this to predefined ffdhe2048 group.
+      -- Modern just forcibly sets this to nil as there are no ciphers that need it.
+      if conf.ssl_cipher_suite ~= "old" then
+        conf.ssl_dhparam = suite.dhparams
+        conf.nginx_http_ssl_dhparam = suite.dhparams
+        conf.nginx_stream_ssl_dhparam = suite.dhparams
+      end
+
     else
       errors[#errors + 1] = "Undefined cipher suite " .. tostring(conf.ssl_cipher_suite)
     end
   end
 
+  if conf.ssl_dhparam then
+    if not is_predefined_dhgroup(conf.ssl_dhparam) and not exists(conf.ssl_dhparam) then
+      errors[#errors + 1] = "ssl_dhparam: no such file at " .. conf.ssl_dhparam
+    end
+
+  else
+    for _, key in ipairs({ "nginx_http_ssl_dhparam", "nginx_stream_ssl_dhparam" }) do
+      local file = conf[key]
+      if file and not is_predefined_dhgroup(file) and not exists(file) then
+        errors[#errors + 1] = key .. ": no such file at " .. file
+      end
+    end
+  end
+
   if conf.headers then
     for _, token in ipairs(conf.headers) do
-      if token ~= "off" and not HEADER_KEY_TO_NAME[string.lower(token)] then
+      if token ~= "off" and not HEADER_KEY_TO_NAME[lower(token)] then
         errors[#errors + 1] = fmt("headers: invalid entry '%s'",
                                   tostring(token))
       end
@@ -849,10 +878,11 @@ local function check_and_infer(conf, opts)
   end
 
   if conf.dns_order then
-    local allowed = { LAST = true, A = true, CNAME = true, SRV = true }
+    local allowed = { LAST = true, A = true, AAAA = true,
+                      CNAME = true, SRV = true }
 
     for _, name in ipairs(conf.dns_order) do
-      if not allowed[name:upper()] then
+      if not allowed[upper(name)] then
         errors[#errors + 1] = fmt("dns_order: invalid entry '%s'",
                                   tostring(name))
       end
@@ -865,7 +895,7 @@ local function check_and_infer(conf, opts)
 
   -- checking the trusted ips
   for _, address in ipairs(conf.trusted_ips) do
-    if not ip.valid(address) and address ~= "unix:" then
+    if not utils.is_valid_ip_or_cidr(address) and address ~= "unix:" then
       errors[#errors + 1] = "trusted_ips must be a comma separated list in " ..
                             "the form of IPv4 or IPv6 address or CIDR "      ..
                             "block or 'unix:', got '" .. address .. "'"
@@ -876,7 +906,7 @@ local function check_and_infer(conf, opts)
     errors[#errors + 1] = "pg_max_concurrent_queries must be greater than 0"
   end
 
-  if conf.pg_max_concurrent_queries ~= math.floor(conf.pg_max_concurrent_queries) then
+  if conf.pg_max_concurrent_queries ~= floor(conf.pg_max_concurrent_queries) then
     errors[#errors + 1] = "pg_max_concurrent_queries must be an integer greater than 0"
   end
 
@@ -884,7 +914,7 @@ local function check_and_infer(conf, opts)
     errors[#errors + 1] = "pg_semaphore_timeout must be greater than 0"
   end
 
-  if conf.pg_semaphore_timeout ~= math.floor(conf.pg_semaphore_timeout) then
+  if conf.pg_semaphore_timeout ~= floor(conf.pg_semaphore_timeout) then
     errors[#errors + 1] = "pg_semaphore_timeout must be an integer greater than 0"
   end
 
@@ -893,7 +923,7 @@ local function check_and_infer(conf, opts)
       errors[#errors + 1] = "pg_ro_max_concurrent_queries must be greater than 0"
     end
 
-    if conf.pg_ro_max_concurrent_queries ~= math.floor(conf.pg_ro_max_concurrent_queries) then
+    if conf.pg_ro_max_concurrent_queries ~= floor(conf.pg_ro_max_concurrent_queries) then
       errors[#errors + 1] = "pg_ro_max_concurrent_queries must be an integer greater than 0"
     end
   end
@@ -903,7 +933,7 @@ local function check_and_infer(conf, opts)
       errors[#errors + 1] = "pg_ro_semaphore_timeout must be greater than 0"
     end
 
-    if conf.pg_ro_semaphore_timeout ~= math.floor(conf.pg_ro_semaphore_timeout) then
+    if conf.pg_ro_semaphore_timeout ~= floor(conf.pg_ro_semaphore_timeout) then
       errors[#errors + 1] = "pg_ro_semaphore_timeout must be an integer greater than 0"
     end
   end
@@ -913,7 +943,7 @@ local function check_and_infer(conf, opts)
   end
 
   if conf.role == "control_plane" then
-    if #conf.admin_listen < 1 or pl_stringx.strip(conf.admin_listen[1]) == "off" then
+    if #conf.admin_listen < 1 or strip(conf.admin_listen[1]) == "off" then
       errors[#errors + 1] = "admin_listen must be specified when role = \"control_plane\""
     end
 
@@ -921,7 +951,7 @@ local function check_and_infer(conf, opts)
       errors[#errors + 1] = "cluster_ca_cert must be specified when cluster_mtls = \"pki\""
     end
 
-    if #conf.cluster_listen < 1 or pl_stringx.strip(conf.cluster_listen[1]) == "off" then
+    if #conf.cluster_listen < 1 or strip(conf.cluster_listen[1]) == "off" then
       errors[#errors + 1] = "cluster_listen must be specified when role = \"control_plane\""
     end
 
@@ -930,7 +960,7 @@ local function check_and_infer(conf, opts)
     end
 
   elseif conf.role == "data_plane" then
-    if #conf.proxy_listen < 1 or pl_stringx.strip(conf.proxy_listen[1]) == "off" then
+    if #conf.proxy_listen < 1 or strip(conf.proxy_listen[1]) == "off" then
       errors[#errors + 1] = "proxy_listen must be specified when role = \"data_plane\""
     end
 
@@ -938,6 +968,25 @@ local function check_and_infer(conf, opts)
       errors[#errors + 1] = "only in-memory storage can be used when role = \"data_plane\"\n" ..
                             "Hint: set database = off in your kong.conf"
     end
+
+    if not conf.lua_ssl_trusted_certificate then
+      conf.lua_ssl_trusted_certificate = {}
+    end
+
+    if conf.cluster_mtls == "shared" then
+      insert(conf.lua_ssl_trusted_certificate, conf.cluster_cert)
+
+    elseif conf.cluster_mtls == "pki" then
+      insert(conf.lua_ssl_trusted_certificate, conf.cluster_ca_cert)
+    end
+  end
+
+  if conf.cluster_data_plane_purge_delay < 60 then
+    errors[#errors + 1] = "cluster_data_plane_purge_delay must be 60 or greater"
+  end
+
+  if conf.cluster_max_payload < 4194304 then
+    errors[#errors + 1] = "cluster_max_payload must be 4194304 (4MB) or greater"
   end
 
   if conf.role == "control_plane" or conf.role == "data_plane" then
@@ -945,12 +994,12 @@ local function check_and_infer(conf, opts)
       errors[#errors + 1] = "cluster certificate and key must be provided to use Hybrid mode"
 
     else
-      if not pl_path.exists(conf.cluster_cert) then
+      if not exists(conf.cluster_cert) then
         errors[#errors + 1] = "cluster_cert: no such file at " ..
                               conf.cluster_cert
       end
 
-      if not pl_path.exists(conf.cluster_cert_key) then
+      if not exists(conf.cluster_cert_key) then
         errors[#errors + 1] = "cluster_cert_key: no such file at " ..
                               conf.cluster_cert_key
       end
@@ -967,6 +1016,30 @@ local function check_and_infer(conf, opts)
 
   if conf.upstream_keepalive_idle_timeout < 0 then
     errors[#errors + 1] = "upstream_keepalive_idle_timeout must be 0 or greater"
+  end
+
+  if conf.opentelemetry_tracing and #conf.opentelemetry_tracing > 0 then
+    local instrumentation = require "kong.tracing.instrumentation"
+    local available_types_map = tablex.deepcopy(instrumentation.available_types)
+    available_types_map["all"] = true
+    available_types_map["off"] = true
+    available_types_map["request"] = true
+
+    for _, trace_type in ipairs(conf.opentelemetry_tracing) do
+      if not available_types_map[trace_type] then
+        errors[#errors + 1] = "invalid opentelemetry tracing type: " .. trace_type
+      end
+    end
+
+    if #conf.opentelemetry_tracing > 1
+      and tablex.find(conf.opentelemetry_tracing, "off")
+    then
+      errors[#errors + 1] = "invalid opentelemetry tracing types: off, other types are mutually exclusive"
+    end
+
+    if conf.opentelemetry_tracing_sampling_rate < 0 or conf.opentelemetry_tracing_sampling_rate > 1 then
+      errors[#errors + 1] = "opentelemetry_tracing_sampling_rate must be between 0 and 1"
+    end
   end
 
   return #errors == 0, errors[1], errors
@@ -993,21 +1066,23 @@ local function overrides(k, default_v, opts, file_conf, arg_conf)
     return value, k
   end
 
-  -- environment variables have higher priority
+  if not opts.from_kong_env then
+    -- environment variables have higher priority
 
-  local env_name = "KONG_" .. string.upper(k)
-  local env = os.getenv(env_name)
-  if env ~= nil then
-    local to_print = env
+    local env_name = "KONG_" .. upper(k)
+    local env = getenv(env_name)
+    if env ~= nil then
+      local to_print = env
 
-    if CONF_SENSITIVE[k] then
-      to_print = CONF_SENSITIVE_PLACEHOLDER
+      if CONF_SENSITIVE[k] then
+        to_print = CONF_SENSITIVE_PLACEHOLDER
+      end
+
+      log.debug('%s ENV found with "%s"', env_name, to_print)
+
+      value = env
+      escape = true
     end
-
-    log.debug('%s ENV found with "%s"', env_name, to_print)
-
-    value = env
-    escape = true
   end
 
   -- arg_conf have highest priority
@@ -1020,7 +1095,7 @@ local function overrides(k, default_v, opts, file_conf, arg_conf)
     -- Escape "#" in env vars or overrides to avoid them being mangled by
     -- comments stripping logic.
     repeat
-      local s, n = string.gsub(value, [[([^\])#]], [[%1\#]])
+      local s, n = gsub(value, [[([^\])#]], [[%1\#]])
       value = s
     until n == 0
   end
@@ -1035,10 +1110,10 @@ local function parse_nginx_directives(dyn_namespace, conf, injected_in_namespace
 
   for k, v in pairs(conf) do
     if type(k) == "string" and not injected_in_namespace[k] then
-      local directive = string.match(k, dyn_namespace.prefix .. "(.+)")
+      local directive = match(k, dyn_namespace.prefix .. "(.+)")
       if directive then
         if v ~= "NONE" and not dyn_namespace.ignore[directive] then
-          table.insert(directives, { name = directive, value = v })
+          insert(directives, { name = directive, value = v })
         end
 
         injected_in_namespace[k] = true
@@ -1075,6 +1150,9 @@ local function deprecated_properties(conf, opts)
 
     if deprecated and conf[property_name] ~= nil then
       if not opts.from_kong_env then
+        if deprecated.value then
+            log.warn("the configuration value '%s' for configuration property '%s' is deprecated", deprecated.value, property_name)
+        end
         if deprecated.replacement then
           log.warn("the '%s' configuration property is deprecated, use " ..
                      "'%s' instead", property_name, deprecated.replacement)
@@ -1171,7 +1249,7 @@ local function load(path, custom_conf, opts)
   ---------------------
 
   local from_file_conf = {}
-  if path and not pl_path.exists(path) then
+  if path and not exists(path) then
     -- file conf has been specified and must exist
     return nil, "no file at: " .. path
   end
@@ -1180,7 +1258,7 @@ local function load(path, custom_conf, opts)
     -- try to look for a conf in default locations, but no big
     -- deal if none is found: we will use our defaults.
     for _, default_path in ipairs(DEFAULT_PATHS) do
-      if pl_path.exists(default_path) then
+      if exists(default_path) then
         path = default_path
         break
       end
@@ -1196,7 +1274,10 @@ local function load(path, custom_conf, opts)
   else
     log.verbose("reading config file at %s", path)
 
-    from_file_conf = load_config_file(path)
+    from_file_conf, err = load_config_file(path)
+    if not from_file_conf then
+      return nil, "could not load config file: " .. err
+    end
   end
 
   -----------------------
@@ -1234,7 +1315,7 @@ local function load(path, custom_conf, opts)
       t = t or {}
 
       for k, v in pairs(t) do
-        local directive = string.match(k, "(" .. dyn_prefix .. ".+)")
+        local directive = match(k, "^(" .. dyn_prefix .. ".+)")
         if directive then
           dynamic_keys[directive] = true
 
@@ -1257,7 +1338,7 @@ local function load(path, custom_conf, opts)
       end
 
       for k, v in pairs(env_vars) do
-        local kong_var = string.match(string.lower(k), "^kong_(.+)")
+        local kong_var = match(lower(k), "^kong_(.+)")
         if kong_var then
           -- the value will be read in `overrides()`
           kong_env_vars[kong_var] = true
@@ -1284,7 +1365,7 @@ local function load(path, custom_conf, opts)
 
   -- merge file conf, ENV variables, and arg conf (with precedence)
   local user_conf = tablex.pairmap(overrides, defaults,
-                                   { no_defaults = true },
+                                   tablex.union(opts, { no_defaults = true, }),
                                    from_file_conf, custom_conf)
 
   if not opts.starting then
@@ -1297,8 +1378,103 @@ local function load(path, custom_conf, opts)
 
   -- merge user_conf with defaults
   local conf = tablex.pairmap(overrides, defaults,
-                              { defaults_only = true },
+                              tablex.union(opts, { defaults_only = true, }),
                               user_conf)
+
+  ---------------------------------
+  -- Dereference process references
+  ---------------------------------
+
+  local loaded_vaults
+  local refs
+  do
+    -- validation
+    local vaults_array = infer_value(conf.vaults, CONF_INFERENCES["vaults"].typ, opts)
+
+    -- merge vaults
+    local vaults = {}
+
+    if #vaults_array > 0 and vaults_array[1] ~= "off" then
+      for i = 1, #vaults_array do
+        local vault_name = strip(vaults_array[i])
+        if vault_name ~= "off" then
+          if vault_name == "bundled" then
+            vaults = tablex.merge(constants.BUNDLED_VAULTS, vaults, true)
+
+          else
+            vaults[vault_name] = true
+          end
+        end
+      end
+    end
+
+    loaded_vaults = setmetatable(vaults, _nop_tostring_mt)
+
+    if get_phase() == "init" then
+      local secrets = getenv("KONG_PROCESS_SECRETS")
+      if secrets then
+        C.unsetenv("KONG_PROCESS_SECRETS")
+
+      else
+        local path = pl_path.join(abspath(ngx.config.prefix()), unpack(PREFIX_PATHS.kong_process_secrets))
+        if exists(path) then
+          secrets, err = pl_file.read(path, true)
+          pl_file.delete(path)
+          if not secrets then
+            return nil, fmt("failed to read process secrets file: %s", err)
+          end
+        end
+      end
+
+      if secrets then
+        secrets, err = process_secrets.deserialize(secrets, path)
+        if not secrets then
+          return nil, err
+        end
+
+        for k, deref in pairs(secrets) do
+          local v = infer_value(conf[k], "string", opts)
+          if refs then
+            refs[k] = v
+          else
+            refs = setmetatable({ [k] = v }, _nop_tostring_mt)
+          end
+
+          conf[k] = deref
+        end
+      end
+
+    else
+      local vault_conf = { loaded_vaults = loaded_vaults }
+      for k, v in pairs(conf) do
+        if sub(k, 1, 6) == "vault_" then
+          vault_conf[k] = infer_value(v, "string", opts)
+        end
+      end
+
+      local vault = require("kong.pdk.vault").new({ configuration = vault_conf })
+
+      for k, v in pairs(conf) do
+        v = infer_value(v, "string", opts)
+        if vault.is_reference(v) then
+          if refs then
+            refs[k] = v
+          else
+            refs = setmetatable({ [k] = v }, _nop_tostring_mt)
+          end
+
+          local deref, deref_err = vault.get(v)
+          if deref == nil or deref_err then
+            return nil, fmt("failed to dereference '%s': %s for config option '%s'", v, deref_err, k)
+          end
+
+          if deref ~= nil then
+            conf[k] = deref
+          end
+        end
+      end
+    end
+  end
 
   -- validation
   local ok, err, errors = check_and_infer(conf, opts)
@@ -1313,16 +1489,35 @@ local function load(path, custom_conf, opts)
 
   conf = tablex.merge(conf, defaults) -- intersection (remove extraneous properties)
 
+  conf.loaded_vaults = loaded_vaults
+  conf["$refs"] = refs
+
+  local default_nginx_main_user = false
+  local default_nginx_user = false
+
   do
     -- nginx 'user' directive
-    local user = utils.strip(conf.nginx_main_user):gsub("%s+", " ")
+    local user = gsub(strip(conf.nginx_main_user), "%s+", " ")
     if user == "nobody" or user == "nobody nobody" then
       conf.nginx_main_user = nil
+
+    elseif user == "kong" or user == "kong kong" then
+      default_nginx_main_user = true
     end
 
-    local user = utils.strip(conf.nginx_user):gsub("%s+", " ")
+    local user = gsub(strip(conf.nginx_user), "%s+", " ")
     if user == "nobody" or user == "nobody nobody" then
       conf.nginx_user = nil
+
+    elseif user == "kong" or user == "kong kong" then
+      default_nginx_user = true
+    end
+  end
+
+  if C.getpwnam("kong") == nil or C.getgrnam("kong") == nil then
+    if default_nginx_main_user == true and default_nginx_user == true then
+      conf.nginx_user = nil
+      conf.nginx_main_user = nil
     end
   end
 
@@ -1331,12 +1526,14 @@ local function load(path, custom_conf, opts)
 
     -- nginx directives from conf
     for _, dyn_namespace in ipairs(DYNAMIC_KEY_NAMESPACES) do
-      injected_in_namespace[dyn_namespace.injected_conf_name] = true
+      if dyn_namespace.injected_conf_name then
+        injected_in_namespace[dyn_namespace.injected_conf_name] = true
 
-      local directives = parse_nginx_directives(dyn_namespace, conf,
-                                                injected_in_namespace)
-      conf[dyn_namespace.injected_conf_name] = setmetatable(directives,
-                                                            _nop_tostring_mt)
+        local directives = parse_nginx_directives(dyn_namespace, conf,
+          injected_in_namespace)
+        conf[dyn_namespace.injected_conf_name] = setmetatable(directives,
+          _nop_tostring_mt)
+      end
     end
 
     -- TODO: Deprecated, but kept for backward compatibility.
@@ -1360,7 +1557,7 @@ local function load(path, custom_conf, opts)
       conf_arr[#conf_arr+1] = k .. " = " .. pl_pretty.write(to_print, "")
     end
 
-    table.sort(conf_arr)
+    sort(conf_arr)
 
     for i = 1, #conf_arr do
       log.debug(conf_arr[i])
@@ -1377,8 +1574,7 @@ local function load(path, custom_conf, opts)
 
     if #conf.plugins > 0 and conf.plugins[1] ~= "off" then
       for i = 1, #conf.plugins do
-        local plugin_name = pl_stringx.strip(conf.plugins[i])
-
+        local plugin_name = strip(conf.plugins[i])
         if plugin_name ~= "off" then
           if plugin_name == "bundled" then
             plugins = tablex.merge(constants.BUNDLED_PLUGINS, plugins, true)
@@ -1402,7 +1598,7 @@ local function load(path, custom_conf, opts)
 
     for _, directive in pairs(http_directives) do
       if directive.name == "lua_shared_dict"
-         and string.find(directive.value, "prometheus_metrics", nil, true)
+         and find(directive.value, "prometheus_metrics", nil, true)
       then
          found = true
          break
@@ -1410,7 +1606,7 @@ local function load(path, custom_conf, opts)
     end
 
     if not found then
-      table.insert(http_directives, {
+      insert(http_directives, {
         name  = "lua_shared_dict",
         value = "prometheus_metrics 5m",
       })
@@ -1421,7 +1617,7 @@ local function load(path, custom_conf, opts)
 
     for _, directive in pairs(stream_directives) do
       if directive.name == "lua_shared_dict"
-        and string.find(directive.value, "stream_prometheus_metrics", nil, true)
+        and find(directive.value, "stream_prometheus_metrics", nil, true)
       then
         found = true
         break
@@ -1429,7 +1625,7 @@ local function load(path, custom_conf, opts)
     end
 
     if not found then
-      table.insert(stream_directives, {
+      insert(stream_directives, {
         name  = "lua_shared_dict",
         value = "stream_prometheus_metrics 5m",
       })
@@ -1437,9 +1633,11 @@ local function load(path, custom_conf, opts)
   end
 
   for _, dyn_namespace in ipairs(DYNAMIC_KEY_NAMESPACES) do
-    table.sort(conf[dyn_namespace.injected_conf_name], function(a, b)
-      return a.name < b.name
-    end)
+    if dyn_namespace.injected_conf_name then
+      sort(conf[dyn_namespace.injected_conf_name], function(a, b)
+        return a.name < b.name
+      end)
+    end
   end
 
   ok, err = listeners.parse(conf, {
@@ -1464,7 +1662,7 @@ local function load(path, custom_conf, opts)
     if #conf.headers > 0 and conf.headers[1] ~= "off" then
       for _, token in ipairs(conf.headers) do
         if token ~= "off" then
-          enabled_headers[HEADER_KEY_TO_NAME[string.lower(token)]] = true
+          enabled_headers[HEADER_KEY_TO_NAME[lower(token)]] = true
         end
       end
     end
@@ -1485,41 +1683,69 @@ local function load(path, custom_conf, opts)
   end
 
   -- load absolute paths
-  conf.prefix = pl_path.abspath(conf.prefix)
+  conf.prefix = abspath(conf.prefix)
 
-  conf.go_pluginserver_exe = pl_path.abspath(conf.go_pluginserver_exe)
+  for _, prefix in ipairs({ "ssl", "admin_ssl", "status_ssl", "client_ssl", "cluster" }) do
+    local ssl_cert = conf[prefix .. "_cert"]
+    local ssl_cert_key = conf[prefix .. "_cert_key"]
 
-  if conf.go_plugins_dir ~= "off" then
-    conf.go_plugins_dir = pl_path.abspath(conf.go_plugins_dir)
-  end
+    if ssl_cert and ssl_cert_key then
+      if type(ssl_cert) == "table" then
+        for i, cert in ipairs(ssl_cert) do
+          ssl_cert[i] = abspath(cert)
+        end
 
-  if conf.ssl_cert and conf.ssl_cert_key then
-    conf.ssl_cert = pl_path.abspath(conf.ssl_cert)
-    conf.ssl_cert_key = pl_path.abspath(conf.ssl_cert_key)
-  end
+      else
+        conf[prefix .. "_cert"] = abspath(ssl_cert)
+      end
 
-  if conf.client_ssl_cert and conf.client_ssl_cert_key then
-    conf.client_ssl_cert = pl_path.abspath(conf.client_ssl_cert)
-    conf.client_ssl_cert_key = pl_path.abspath(conf.client_ssl_cert_key)
-  end
+      if type(ssl_cert) == "table" then
+        for i, key in ipairs(ssl_cert_key) do
+          ssl_cert_key[i] = abspath(key)
+        end
 
-  if conf.admin_ssl_cert and conf.admin_ssl_cert_key then
-    conf.admin_ssl_cert = pl_path.abspath(conf.admin_ssl_cert)
-    conf.admin_ssl_cert_key = pl_path.abspath(conf.admin_ssl_cert_key)
-  end
-
-  if conf.lua_ssl_trusted_certificate then
-    conf.lua_ssl_trusted_certificate =
-      pl_path.abspath(conf.lua_ssl_trusted_certificate)
-  end
-
-  if conf.cluster_cert and conf.cluster_cert_key then
-    conf.cluster_cert = pl_path.abspath(conf.cluster_cert)
-    conf.cluster_cert_key = pl_path.abspath(conf.cluster_cert_key)
+      else
+        conf[prefix .. "_cert_key"] = abspath(ssl_cert_key)
+      end
+    end
   end
 
   if conf.cluster_ca_cert then
-    conf.cluster_ca_cert = pl_path.abspath(conf.cluster_ca_cert)
+    conf.cluster_ca_cert = abspath(conf.cluster_ca_cert)
+  end
+
+  local ssl_enabled = conf.proxy_ssl_enabled or
+                      conf.stream_proxy_ssl_enabled or
+                      conf.admin_ssl_enabled or
+                      conf.status_ssl_enabled
+
+  for _, name in ipairs({ "nginx_http_directives", "nginx_stream_directives" }) do
+    for i, directive in ipairs(conf[name]) do
+      if directive.name == "ssl_dhparam" then
+        if is_predefined_dhgroup(directive.value) then
+          if ssl_enabled then
+            directive.value = abspath(pl_path.join(conf.prefix, "ssl", directive.value .. ".pem"))
+
+          else
+            remove(conf[name], i)
+          end
+
+        else
+          directive.value = abspath(directive.value)
+        end
+
+        break
+      end
+    end
+  end
+
+  if conf.lua_ssl_trusted_certificate
+     and #conf.lua_ssl_trusted_certificate > 0 then
+    conf.lua_ssl_trusted_certificate =
+      tablex.map(pl_path.abspath, conf.lua_ssl_trusted_certificate)
+
+    conf.lua_ssl_trusted_certificate_combined =
+      abspath(pl_path.join(conf.prefix, ".ca_combined"))
   end
 
   -- attach prefix files paths
@@ -1548,6 +1774,16 @@ return setmetatable({
 
   remove_sensitive = function(conf)
     local purged_conf = tablex.deepcopy(conf)
+
+    local refs = purged_conf["$refs"]
+    if type(refs) == "table" then
+      for k, v in pairs(refs) do
+        if not CONF_SENSITIVE[k] then
+          purged_conf[k] = v
+        end
+      end
+      purged_conf["$refs"] = nil
+    end
 
     for k in pairs(CONF_SENSITIVE) do
       if purged_conf[k] then

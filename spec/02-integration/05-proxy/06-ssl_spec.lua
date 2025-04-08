@@ -45,6 +45,13 @@ for _, strategy in helpers.each_strategy() do
         service   = service2,
       }
 
+      bp.routes:insert {
+        protocols = { "https" },
+        hosts     = { "sni.example.com" },
+        snis      = { "sni.example.com" },
+        service   = service2,
+      }
+
       local service4 = bp.services:insert {
         name     = "api-3",
         protocol = helpers.mock_upstream_ssl_protocol,
@@ -139,8 +146,11 @@ for _, strategy in helpers.each_strategy() do
       })
 
       local cert = bp.certificates:insert {
-        cert  = ssl_fixtures.cert,
-        key   = ssl_fixtures.key,
+        cert     = ssl_fixtures.cert,
+        key      = ssl_fixtures.key,
+        cert_alt = ssl_fixtures.cert_ecdsa,
+        key_alt  = ssl_fixtures.key_ecdsa,
+
       }
 
       bp.snis:insert {
@@ -163,6 +173,8 @@ for _, strategy in helpers.each_strategy() do
       local certificate_alt_alt = bp.certificates:insert {
         cert = ssl_fixtures.cert_alt_alt,
         key = ssl_fixtures.key_alt_alt,
+        cert_alt = ssl_fixtures.cert_alt_alt_ecdsa,
+        key_alt = ssl_fixtures.key_alt_alt_ecdsa,
       }
 
       bp.snis:insert {
@@ -200,6 +212,8 @@ for _, strategy in helpers.each_strategy() do
         nginx_http_proxy_ssl_trusted_certificate = "../spec/fixtures/kong_spec.crt",
       })
 
+      ngx.sleep(0.01)
+
       proxy_client = helpers.proxy_client()
       https_client = helpers.proxy_ssl_client()
     end)
@@ -210,9 +224,7 @@ for _, strategy in helpers.each_strategy() do
 
     describe("proxy ssl verify", function()
       it("prevents requests to upstream that does not possess a trusted certificate", function()
-        -- setup: cleanup logs
-        local test_error_log_path = helpers.test_conf.nginx_err_logs
-        os.execute(":> " .. test_error_log_path)
+        helpers.clean_logfile()
 
         local res = assert(proxy_client:send {
           method  = "GET",
@@ -223,32 +235,9 @@ for _, strategy in helpers.each_strategy() do
         })
         local body = assert.res_status(502, res)
         assert.equal("An invalid response was received from the upstream server", body)
-
-        local pl_file = require("pl.file")
-
-        helpers.wait_until(function()
-          -- Assertion: there should be [error] resulting from
-          -- TLS handshake failure
-
-          local logs = pl_file.read(test_error_log_path)
-          local found = false
-
-          for line in logs:gmatch("[^\r\n]+") do
-            if line:find("upstream SSL certificate verify error: " ..
-                         "(20:unable to get local issuer certificate) " ..
-                         "while SSL handshaking to upstream", nil, true)
-            then
-              found = true
-
-            else
-              assert.not_match("[error]", line, nil, true)
-            end
-          end
-
-          if found then
-              return true
-          end
-        end, 2)
+        assert.logfile().has.line("upstream SSL certificate verify error: " ..
+                                  "(20:unable to get local issuer certificate) " ..
+                                  "while SSL handshaking to upstream", true, 2)
       end)
 
       it("trusted certificate, request goes through", function()
@@ -335,6 +324,21 @@ for _, strategy in helpers.each_strategy() do
 
         local body = assert.res_status(426, res)
         local json = cjson.decode(body)
+        assert.same({ message = "Please use HTTPS protocol" }, json)
+        assert.contains("Upgrade", res.headers.connection)
+        assert.equal("TLS/1.2, HTTP/1.1", res.headers.upgrade)
+
+        -- SNI case, see #6425
+        res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/",
+          headers = {
+            ["Host"] = "sni.example.com",
+          }
+        })
+
+        body = assert.res_status(426, res)
+        json = cjson.decode(body)
         assert.same({ message = "Please use HTTPS protocol" }, json)
         assert.contains("Upgrade", res.headers.connection)
         assert.equal("TLS/1.2, HTTP/1.1", res.headers.upgrade)
@@ -516,8 +520,6 @@ for _, strategy in helpers.each_strategy() do
   end)
 
   describe("TLS proxy [#" .. strategy .. "]", function()
-    local https_client
-
     lazy_setup(function()
       local bp = helpers.get_db_utils(strategy, {
         "routes",
@@ -538,10 +540,18 @@ for _, strategy in helpers.each_strategy() do
         snis     = { "example.com" },
         service   = service,
       }
+      
+      bp.routes:insert {
+        protocols = { "tls" },
+        snis      = { "foobar.example.com." },
+        service   = service,
+      }
 
       local cert = bp.certificates:insert {
-        cert  = ssl_fixtures.cert,
-        key   = ssl_fixtures.key,
+        cert     = ssl_fixtures.cert,
+        key      = ssl_fixtures.key,
+        cert_alt = ssl_fixtures.cert_ecdsa,
+        key_alt  = ssl_fixtures.key_ecdsa,
       }
 
       bp.snis:insert {
@@ -554,17 +564,23 @@ for _, strategy in helpers.each_strategy() do
         stream_listen = "127.0.0.1:9020 ssl"
       })
 
-    https_client = helpers.http_client("127.0.0.1", 9020, 60000)
-    assert(https_client:ssl_handshake(nil, "example.com", false)) -- explicit no-verify
+    
     end)
 
     lazy_teardown(function()
       helpers.stop_kong()
-      https_client:close()
     end)
 
     describe("can route normally", function()
       it("sets the default certificate of '*' SNI", function()
+        local https_client = helpers.http_client({
+          scheme = "https",
+          host = "127.0.0.1",
+          port = 9020,
+          timeout = 60000,
+          ssl_verify = false,
+          ssl_server_name = "example.com",
+        })
         local res = assert(https_client:send {
           method  = "GET",
           path    = "/",
@@ -575,6 +591,24 @@ for _, strategy in helpers.each_strategy() do
         local cert = get_cert("example.com")
         -- this fails if the "example.com" SNI wasn't inserted above
         assert.certificate(cert).has.cn("ssl-example.com")
+        https_client:close()
+      end)
+      it("using FQDN (regression for issue 7550)", function()
+        local https_client = helpers.http_client({
+          scheme = "https",
+          host = "127.0.0.1",
+          port = 9020,
+          timeout = 60000,
+          ssl_verify = false,
+          ssl_server_name = "foobar.example.com",
+        })
+        local res = assert(https_client:send {
+          method  = "GET",
+          path    = "/",
+        })
+
+        assert.res_status(404, res)
+        https_client:close()
       end)
     end)
   end)
@@ -600,8 +634,10 @@ for _, strategy in helpers.each_strategy() do
       }
 
       local cert = bp.certificates:insert {
-        cert  = ssl_fixtures.cert,
-        key   = ssl_fixtures.key,
+        cert     = ssl_fixtures.cert,
+        key      = ssl_fixtures.key,
+        cert_alt = ssl_fixtures.cert_ecdsa,
+        key_alt  = ssl_fixtures.key_ecdsa,
       }
 
       bp.snis:insert {

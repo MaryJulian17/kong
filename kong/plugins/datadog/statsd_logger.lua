@@ -7,30 +7,36 @@ local tostring     = tostring
 
 
 local stat_types = {
-  gauge     = "g",
-  counter   = "c",
-  timer     = "ms",
-  histogram = "h",
-  meter     = "m",
-  set       = "s",
+  gauge        = "g",
+  counter      = "c",
+  timer        = "ms",
+  histogram    = "h",
+  meter        = "m",
+  set          = "s",
+  distribution = "d",
 }
 
 
 local statsd_mt = {}
 statsd_mt.__index = statsd_mt
 
+local env_datadog_agent_host = os.getenv 'KONG_DATADOG_AGENT_HOST'
+local env_datadog_agent_port = tonumber(os.getenv 'KONG_DATADOG_AGENT_PORT' or "")
 
 function statsd_mt:new(conf)
   local sock   = udp()
-  local _, err = sock:setpeername(conf.host, conf.port)
+  local host = conf.host or env_datadog_agent_host
+  local port = conf.port or env_datadog_agent_port
+
+  local _, err = sock:setpeername(host, port)
   if err then
-    return nil, fmt("failed to connect to %s:%s: %s", conf.host,
-                    tostring(conf.port), err)
+    return nil, fmt("failed to connect to %s:%s: %s", tostring(host),
+                    tostring(port), err)
   end
 
   local statsd = {
-    host       = conf.host,
-    port       = conf.port,
+    host       = host,
+    port       = port,
     prefix     = conf.prefix,
     socket     = sock,
     stat_types = stat_types,

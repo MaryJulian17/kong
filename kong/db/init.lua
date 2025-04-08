@@ -1,3 +1,5 @@
+local version      = require "version"
+
 local DAO          = require "kong.db.dao"
 local Entity       = require "kong.db.schema.entity"
 local Errors       = require "kong.db.errors"
@@ -143,6 +145,16 @@ function DB:init_connector()
 
   self.infos = self.connector:infos()
 
+  local version_constants = constants.DATABASE[self.strategy:upper()]
+
+  if version_constants then
+    ok, err = self:check_version_compat(version_constants.MIN,
+                                        version_constants.DEPRECATED)
+    if not ok then
+      return nil, prefix_err(self, err)
+    end
+  end
+
   return ok
 end
 
@@ -230,6 +242,32 @@ function DB:set_events_handler(events)
   for _, dao in pairs(self.daos) do
     dao.events = events
   end
+end
+
+
+function DB:check_version_compat(min, deprecated)
+  local _major_minor = self.connector.major_minor_version
+
+  if not _major_minor then
+    return false, "no version info on connector"
+  end
+
+  local major_minor = version(_major_minor)
+  local min_version = version(min)
+  local deprecated = deprecated and version(deprecated)
+
+  if major_minor < min_version then
+    -- Deprecated is "ok"
+    if deprecated and major_minor >= deprecated then
+      log.warn("Currently using %s %s which is considered deprecated, " ..
+               "please use %s or greater", self.strategy, _major_minor, min)
+    else
+      return false, fmt("Kong requires %s %s or greater (currently using %s)",
+                        self.strategy, min, _major_minor)
+    end
+  end
+
+  return true
 end
 
 
@@ -382,7 +420,6 @@ end
 do
   -- migrations
   local utils = require "kong.tools.utils"
-  local MigrationHelpers = require "kong.db.migrations.helpers"
   local MigrationsState = require "kong.db.migrations.state"
 
 
@@ -479,8 +516,6 @@ do
       return nil, prefix_err(self, err)
     end
 
-    local mig_helpers = MigrationHelpers.new(self.connector)
-
     local n_migrations = 0
     local n_pending = 0
 
@@ -509,12 +544,23 @@ do
         if run_up then
           -- kong migrations bootstrap
           -- kong migrations up
-          ok, err = self.connector:run_up_migration(mig.name,
-                                                    strategy_migration.up)
-          if not ok then
-            self.connector:close()
-            return nil, fmt_err(self, "failed to run migration '%s' up: %s",
-                                mig.name, err)
+          if strategy_migration.up and strategy_migration.up ~= "" then
+            ok, err = self.connector:run_up_migration(mig.name,
+                                                      strategy_migration.up)
+            if not ok then
+              self.connector:close()
+              return nil, fmt_err(self, "failed to run migration '%s' up: %s",
+                                  mig.name, err)
+            end
+          end
+
+          if strategy_migration.up_f then
+            local pok, perr, err = xpcall(strategy_migration.up_f, debug.traceback, self.connector)
+            if not pok or err then
+              self.connector:close()
+              return nil, fmt_err(self, "failed to run migration '%s' up_f: %s",
+                                         mig.name, perr or err)
+            end
           end
 
           local state = "executed"
@@ -550,8 +596,7 @@ do
           -- kong migrations teardown
           local f = strategy_migration.teardown
 
-          local pok, perr, err = xpcall(f, debug.traceback, self.connector,
-                                        mig_helpers)
+          local pok, perr, err = xpcall(f, debug.traceback, self.connector)
           if not pok or err then
             self.connector:close()
             return nil, fmt_err(self, "failed to run migration '%s' teardown: %s",

@@ -16,6 +16,7 @@ local STAT_TYPES = {
   "meter",
   "set",
   "timer",
+  "distribution",
 }
 
 local CONSUMER_IDENTIFIERS = {
@@ -68,14 +69,16 @@ local DEFAULT_METRICS = {
 return {
   name = "datadog",
   fields = {
-    { protocols = typedefs.protocols_http },
+    { protocols = typedefs.protocols },
     { config = {
         type = "record",
-        default = { metrics = DEFAULT_METRICS },
         fields = {
-          { host = typedefs.host({ required = true, default = "localhost" }), },
-          { port = typedefs.port({ required = true, default = 8125 }), },
+          { host = typedefs.host({ default = "localhost" }), },
+          { port = typedefs.port({ default = 8125 }), },
           { prefix = { type = "string", default = "kong" }, },
+          { service_name_tag = { type = "string", default = "name" }, },
+          { status_tag = { type = "string", default = "status" }, },
+          { consumer_tag = { type = "string", default = "consumer" }, },
           { metrics = {
               type     = "array",
               required = true,
@@ -95,7 +98,10 @@ return {
                     if_match = { one_of = { "counter", "gauge" }, },
                     then_field = "sample_rate",
                     then_match = { required = true },
-                  }, },
-  }, }, }, }, }, }, }, },
+          }, }, }, }, }, },
+        },
+      },
+    },
+  },
 }
 

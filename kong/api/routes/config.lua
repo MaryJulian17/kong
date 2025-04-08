@@ -5,17 +5,10 @@ local errors = require("kong.db.errors")
 
 local kong = kong
 local ngx = ngx
-local dc = declarative.new_config(kong.configuration)
+local type = type
 local table = table
 local tostring = tostring
 
-
--- Do not accept Lua configurations from the Admin API
--- because it is Turing-complete.
-local accept = {
-  yaml = true,
-  json = true,
-}
 
 local _reports = {
   decl_fmt_version = false,
@@ -71,18 +64,25 @@ return {
       end
       self.params.check_hash = nil
 
+      local dc = declarative.new_config(kong.configuration)
+
       local entities, _, err_t, meta, new_hash
       if self.params._format_version then
         entities, _, err_t, meta, new_hash = dc:parse_table(self.params)
       else
         local config = self.params.config
         if not config then
-          return kong.response.exit(400, {
-            message = "expected a declarative configuration"
-          })
+          local body = kong.request.get_raw_body()
+          if type(body) == "string" and #body > 0 then
+            config = body
+          else
+            return kong.response.exit(400, {
+              message = "expected a declarative configuration"
+            })
+          end
         end
         entities, _, err_t, meta, new_hash =
-          dc:parse_string(config, nil, accept, old_hash)
+          dc:parse_string(config, nil, old_hash)
       end
 
       if not entities then
@@ -107,10 +107,17 @@ return {
           })
         end
 
-        if err == "no memory" then
-          kong.log.err("not enough cache space for declarative config")
+        if err == "exiting" then
+          return kong.response.exit(503, {
+            message = "Kong currently exiting"
+          })
+        end
+
+        if err == "map full" then
+          kong.log.err("not enough space for declarative config")
           return kong.response.exit(413, {
-            message = "Configuration does not fit in Kong cache"
+            message = "Configuration does not fit in LMDB database, " ..
+                      "consider raising the \"lmdb_map_size\" config for Kong"
           })
         end
 

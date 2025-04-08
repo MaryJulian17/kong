@@ -1,5 +1,5 @@
 ---
--- Manipulation of the response from the Service
+-- Module for manipulating the response from the Service.
 -- @module kong.service.response
 
 
@@ -29,7 +29,8 @@ cjson.decode_array_with_array_mt(true)
 local PHASES = phase_checker.phases
 
 
-local header_body_log = phase_checker.new(PHASES.header_filter,
+local header_body_log = phase_checker.new(PHASES.response,
+                                          PHASES.header_filter,
                                           PHASES.body_filter,
                                           PHASES.log)
 
@@ -141,16 +142,17 @@ local function new(pdk, major_version)
   --
   -- @function kong.service.response.get_status
   -- @phases `header_filter`, `body_filter`, `log`
-  -- @treturn number|nil the status code from the response from the Service, or `nil`
-  -- if the request was not proxied (i.e. `kong.response.get_source()` returned
-  -- anything other than `"service"`.
+  -- @treturn number|nil The status code from the response from the Service, or `nil`
+  -- if the request was not proxied (that is, if `kong.response.get_source()` returned
+  -- anything other than `"service"`).
   -- @usage
   -- kong.log.inspect(kong.service.response.get_status()) -- 418
   function response.get_status()
     check_phase(header_body_log)
 
-    if pdk.ctx.core.buffered_status then
-      return pdk.ctx.core.buffered_status
+    local ctx = ngx.ctx
+    if ctx.buffered_status then
+      return ctx.buffered_status
     end
 
     return tonumber(sub(ngx.var.upstream_status or "", -3))
@@ -158,15 +160,15 @@ local function new(pdk, major_version)
 
 
   ---
-  -- Returns a Lua table holding the headers from the response from the Service. Keys are
+  -- Returns a Lua table holding the headers from the Service response. Keys are
   -- header names. Values are either a string with the header value, or an array of
   -- strings if a header was sent multiple times. Header names in this table are
   -- case-insensitive and dashes (`-`) can be written as underscores (`_`); that is,
   -- the header `X-Custom-Header` can also be retrieved as `x_custom_header`.
   --
-  -- Unlike `kong.response.get_headers()`, this function will only return headers that
-  -- were present in the response from the Service (ignoring headers added by Kong itself).
-  -- If the request was not proxied to a Service (e.g. an authentication plugin rejected
+  -- Unlike `kong.response.get_headers()`, this function only returns headers that
+  -- are present in the response from the Service (ignoring headers added by Kong itself).
+  -- If the request is not proxied to a Service (e.g. an authentication plugin rejected
   -- a request and produced an HTTP 401 response), then the returned `headers` value
   -- might be `nil`, since no response from the Service has been received.
   --
@@ -175,10 +177,11 @@ local function new(pdk, major_version)
   -- greater than **1** and not greater than **1000**.
   -- @function kong.service.response.get_headers
   -- @phases `header_filter`, `body_filter`, `log`
-  -- @tparam[opt] number max_headers customize the headers to parse
-  -- @treturn table the response headers in table form
-  -- @treturn string err If more headers than `max_headers` were present, a
-  -- string with the error `"truncated"`.
+  -- @tparam[opt] number max_headers Sets a limit on the maximum number of
+  -- headers that can be parsed.
+  -- @treturn table The response headers in table form.
+  -- @treturn string If more headers than `max_headers` are present, returns
+  -- a string with the error `"truncated"`.
   -- @usage
   -- -- Given a response with the following headers:
   -- -- X-Custom-Header: bla
@@ -193,7 +196,7 @@ local function new(pdk, major_version)
   function response.get_headers(max_headers)
     check_phase(header_body_log)
 
-    local buffered_headers = pdk.ctx.core.buffered_headers
+    local buffered_headers = ngx.ctx.buffered_headers
 
     if max_headers == nil then
       if buffered_headers then
@@ -223,21 +226,21 @@ local function new(pdk, major_version)
   ---
   -- Returns the value of the specified response header.
   --
-  -- Unlike `kong.response.get_header()`, this function will only return a header
-  -- if it was present in the response from the Service (ignoring headers added by Kong
+  -- Unlike `kong.response.get_header()`, this function only returns a header
+  -- if it is present in the response from the Service (ignoring headers added by Kong
   -- itself).
   --
   -- @function kong.service.response.get_header
   -- @phases `header_filter`, `body_filter`, `log`
   -- @tparam string name The name of the header.
   --
-  -- Header names in are case-insensitive and are normalized to lowercase, and
-  -- dashes (`-`) can be written as underscores (`_`); that is, the header
-  -- `X-Custom-Header` can also be retrieved as `x_custom_header`.
+  --   Header names in are case-insensitive and are normalized to lowercase, and
+  --   dashes (`-`) can be written as underscores (`_`); that is, the header
+  --   `X-Custom-Header` can also be retrieved as `x_custom_header`.
   --
   -- @treturn string|nil The value of the header, or `nil` if a header with
-  -- `name` was not found in the response. If a header with the same name is present
-  -- multiple times in the response, this function will return the value of the
+  -- `name` is not found in the response. If a header with the same name is present
+  -- multiple times in the response, this function returns the value of the
   -- first occurrence of this header.
   -- @usage
   -- -- Given a response with the following headers:
@@ -268,7 +271,7 @@ local function new(pdk, major_version)
   --
   -- @function kong.service.response.get_raw_body
   -- @phases `header_filter`, `body_filter`, `log`
-  -- @treturn string body The raw buffered body
+  -- @treturn string The raw buffered body.
   -- @usage
   -- -- Plugin needs to call kong.service.request.enable_buffering() on `rewrite`
   -- -- or `access` phase prior calling this function.
@@ -276,12 +279,13 @@ local function new(pdk, major_version)
   -- local body = kong.service.response.get_raw_body()
   function response.get_raw_body()
     check_phase(header_body_log)
-    if not pdk.ctx.core.buffered_proxying then
+    local ctx = ngx.ctx
+    if not ctx.buffered_proxying then
       error("service body is only available with buffered proxying " ..
             "(see: kong.service.request.enable_buffering function)", 2)
     end
 
-    return pdk.ctx.core.buffered_body or ""
+    return ctx.buffered_body or ""
   end
 
 
@@ -290,10 +294,10 @@ local function new(pdk, major_version)
   --
   -- @function kong.service.response.get_body
   -- @phases `header_filter`, `body_filter`, `log`
-  -- @tparam string mimetype The mime-type of the response (if known)
-  -- @tparam[opt] string mimetype the MIME type
-  -- @tparam[opt] number max_args set a limit on the maximum number of parsed
-  -- @treturn string body The raw buffered body
+  -- @tparam[opt] string mimetype The MIME type of the response (if known).
+  -- @tparam[opt] number max_args Sets a limit on the maximum number of (what?)
+  -- that can be parsed.
+  -- @treturn string The raw buffered body
   -- @usage
   -- -- Plugin needs to call kong.service.request.enable_buffering() on `rewrite`
   -- -- or `access` phase prior calling this function.
@@ -301,7 +305,7 @@ local function new(pdk, major_version)
   -- local body = kong.service.response.get_body()
   function response.get_body(mimetype, max_args)
     check_phase(header_body_log)
-    if not pdk.ctx.core.buffered_proxying then
+    if not ngx.ctx.buffered_proxying then
       error("service body is only available with buffered proxying " ..
             "(see: kong.service.request.enable_buffering function)", 2)
     end
@@ -352,8 +356,17 @@ local function new(pdk, major_version)
     elseif find(content_type_lower, CONTENT_TYPE_FORM_DATA, 1, true) == 1 then
       local body = response.get_raw_body()
 
-      -- TODO: multipart library doesn't support multiple fields with same name
-      return multipart(body, content_type):get_all(), nil, CONTENT_TYPE_FORM_DATA
+      local parts = multipart(body, content_type)
+      if not parts then
+        return nil, "unable to decode multipart body", CONTENT_TYPE_FORM_DATA
+      end
+
+      local margs = parts:get_all_with_arrays()
+      if not margs then
+        return nil, "unable to read multipart values", CONTENT_TYPE_FORM_DATA
+      end
+
+      return margs, nil, CONTENT_TYPE_FORM_DATA
 
     else
       return nil, "unsupported content type '" .. content_type .. "'", content_type_lower

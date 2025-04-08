@@ -2,6 +2,8 @@ local cjson = require "cjson.safe"
 local utils = require "kong.tools.utils"
 local constants = require "kong.constants"
 local counter = require "resty.counter"
+local knode = (kong and kong.node) and kong.node or
+              require "kong.pdk.node".new()
 
 
 local kong_dict = ngx.shared.kong
@@ -18,6 +20,7 @@ local pairs = pairs
 local error = error
 local type = type
 local WARN = ngx.WARN
+local DEBUG = ngx.DEBUG
 local sub = string.sub
 
 
@@ -39,6 +42,7 @@ local WSS_REQUEST_COUNT_KEY   = "events:requests:wss"
 local STREAM_COUNT_KEY        = "events:streams"
 local TCP_STREAM_COUNT_KEY    = "events:streams:tcp"
 local TLS_STREAM_COUNT_KEY    = "events:streams:tls"
+local UDP_STREAM_COUNT_KEY    = "events:streams:udp"
 
 
 local GO_PLUGINS_REQUEST_COUNT_KEY = "events:requests:go_plugins"
@@ -49,6 +53,8 @@ local _ping_infos = {}
 local _enabled = false
 local _unique_str = utils.random_string()
 local _buffer_immutable_idx
+local _ssl_session
+local _ssl_verify = false
 
 -- the resty.counter instance, will be initialized in `init_worker`
 local report_counter = nil
@@ -59,6 +65,8 @@ do
   local meta = require "kong.meta"
 
   local system_infos = utils.get_system_infos()
+
+  system_infos.hostname = system_infos.hostname or knode.get_hostname()
 
   -- <14>: syslog facility code 'log alert'
   _buffer[#_buffer + 1] = "<14>version=" .. meta._VERSION
@@ -103,10 +111,9 @@ local function send_report(signal_type, t, host, port)
   elseif type(signal_type) ~= "string" then
     return error("signal_type (arg #1) must be a string", 2)
   end
-
   t = t or {}
   host = host or constants.REPORTS.ADDRESS
-  port = port or constants.REPORTS.STATS_PORT
+  port = port or constants.REPORTS.STATS_TLS_PORT
 
   -- add signal type to data
 
@@ -117,7 +124,9 @@ local function send_report(signal_type, t, host, port)
   local mutable_idx = _buffer_immutable_idx
 
   for k, v in pairs(t) do
-    if k == "unique_id" or (k ~= "created_at" and sub(k, -2) ~= "id") then
+    if k == "unique_id" or k == "cluster_id" or
+       (k ~= "created_at" and sub(k, -2) ~= "id")
+    then
       v = serialize_report_value(v)
       if v ~= nil then
         mutable_idx = mutable_idx + 1
@@ -136,6 +145,14 @@ local function send_report(signal_type, t, host, port)
   if not ok then
     return
   end
+
+  local hs_ok, err = sock:sslhandshake(_ssl_session, nil, _ssl_verify)
+  if not hs_ok then
+    log(DEBUG, "failed to complete SSL handshake for reports: ", err)
+    return
+  end
+
+  _ssl_session = hs_ok
 
   sock:send(concat(_buffer, ";", 1, mutable_idx) .. "\n")
   sock:setkeepalive()
@@ -203,21 +220,16 @@ end
 
 
 -- returns a string indicating the "kind" of the current request/stream:
--- "http", "https", "h2c", "h2", "grpc", "grpcs", "ws", "wss", "tcp", "tls"
+-- "http", "https", "h2c", "h2", "grpc", "grpcs", "ws", "wss", "tcp", "tls", "udp"
 -- or nil + error message if the suffix could not be determined
-local function get_current_suffix(ctx)
-  if subsystem == "stream" then
-    if var.ssl_protocol then
-      return "tls"
-    end
+local get_current_suffix
 
-    return "tcp"
-  end
-
+if subsystem == "http" then
+function get_current_suffix(ctx)
   local scheme = var.scheme
   local proxy_mode = var.kong_proxy_mode
   if scheme == "http" or scheme == "https" then
-    if proxy_mode == "http" then
+    if proxy_mode == "http" or proxy_mode == "unbuffered" then
       local http_upgrade = var.http_upgrade
       if http_upgrade and lower(http_upgrade) == "websocket" then
         if scheme == "http" then
@@ -257,13 +269,28 @@ local function get_current_suffix(ctx)
             ", proxy_mode=", tostring(proxy_mode), ")")
 end
 
+else -- subsystem == "stream"
+  function get_current_suffix(ctx)
+    if var.ssl_protocol then
+      return "tls"
+    end
+
+    return lower(var.protocol)
+  end
+end
+
 
 local function send_ping(host, port)
   _ping_infos.unique_id = _unique_str
 
+  if not _ping_infos.cluster_id then
+    _ping_infos.cluster_id = kong.cluster.get_id()
+  end
+
   if subsystem == "stream" then
     _ping_infos.streams     = get_counter(STREAM_COUNT_KEY)
     _ping_infos.tcp_streams = get_counter(TCP_STREAM_COUNT_KEY)
+    _ping_infos.udp_streams = get_counter(UDP_STREAM_COUNT_KEY)
     _ping_infos.tls_streams = get_counter(TLS_STREAM_COUNT_KEY)
     _ping_infos.go_plugin_reqs = get_counter(GO_PLUGINS_REQUEST_COUNT_KEY)
 
@@ -271,6 +298,7 @@ local function send_ping(host, port)
 
     reset_counter(STREAM_COUNT_KEY, _ping_infos.streams)
     reset_counter(TCP_STREAM_COUNT_KEY, _ping_infos.tcp_streams)
+    reset_counter(UDP_STREAM_COUNT_KEY, _ping_infos.udp_streams)
     reset_counter(TLS_STREAM_COUNT_KEY, _ping_infos.tls_streams)
     reset_counter(GO_PLUGINS_REQUEST_COUNT_KEY, _ping_infos.go_plugin_reqs)
 

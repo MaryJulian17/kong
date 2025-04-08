@@ -73,6 +73,15 @@ for _, strategy in helpers.each_strategy() do
         hosts = { "key-auth10.com" },
       }
 
+      local route_grpc = assert(bp.routes:insert {
+        protocols = { "grpc" },
+        paths = { "/hello.HelloService/" },
+        service = assert(bp.services:insert {
+          name = "grpc",
+          url = helpers.grpcbin_url,
+        }),
+      })
+
       bp.plugins:insert {
         name     = "key-auth",
         route = { id = route1.id },
@@ -154,6 +163,11 @@ for _, strategy in helpers.each_strategy() do
         config = {
           anonymous = anonymous_user.username,
         },
+      }
+
+      bp.plugins:insert {
+        name     = "key-auth",
+        route = { id = route_grpc.id },
       }
 
       assert(helpers.start_kong({
@@ -297,6 +311,33 @@ for _, strategy in helpers.each_strategy() do
             })
             assert.res_status(200, res)
           end)
+          it("authenticates valid credentials in query", function()
+            local res = assert(proxy_client:send {
+              path    = "/request?apikey=kong",
+              headers = {
+                ["Host"]         = "key-auth5.com",
+                ["Content-Type"] = type,
+              },
+              body    = {
+                non_apikey = "kong",
+              }
+            })
+            assert.res_status(200, res)
+          end)
+          it("authenticates valid credentials in header", function()
+            local res = assert(proxy_client:send {
+              path    = "/request?apikey=kong",
+              headers = {
+                ["Host"]         = "key-auth5.com",
+                ["Content-Type"] = type,
+                ["apikey"]       = "kong",
+              },
+              body    = {
+                non_apikey = "kong",
+              }
+            })
+            assert.res_status(200, res)
+          end)
           it("returns 401 Unauthorized on invalid key", function()
             local res = assert(proxy_client:send {
               path    = "/status/200",
@@ -405,6 +446,27 @@ for _, strategy in helpers.each_strategy() do
       end)
     end)
 
+    describe("key in gRPC headers", function()
+      it("rejects call without credentials", function()
+        local ok, err = helpers.proxy_client_grpc(){
+          service = "hello.HelloService.SayHello",
+          opts = {},
+        }
+        assert.falsy(ok)
+        assert.matches("Code: Unauthenticated", err)
+      end)
+      it("accepts authorized calls", function()
+        local ok, res = helpers.proxy_client_grpc(){
+          service = "hello.HelloService.SayHello",
+          opts = {
+            ["-H"] = "'apikey: kong'",
+          },
+        }
+        assert.truthy(ok)
+        assert.same({ reply = "hello noname" }, cjson.decode(res))
+      end)
+    end)
+
     describe("underscores or hyphens in key headers", function()
       it("authenticates valid credentials", function()
         local res = assert(proxy_client:send {
@@ -469,7 +531,6 @@ for _, strategy in helpers.each_strategy() do
         assert.is_string(json.headers["x-consumer-id"])
         assert.equal("bob", json.headers["x-consumer-username"])
         assert.equal(kong_cred.id, json.headers["x-credential-identifier"])
-        assert.equal(nil, json.headers["x-credential-username"])
         assert.is_nil(json.headers["x-anonymous-consumer"])
       end)
     end)
@@ -579,9 +640,9 @@ for _, strategy in helpers.each_strategy() do
           body = "foobar",
         })
 
-        local body = assert.res_status(400, res)
+        local body = assert.res_status(401, res)
         local json = cjson.decode(body)
-        assert.same({ message = "Cannot process request body" }, json)
+        assert.same({ message = "No API key found in request" }, json)
       end)
     end)
 
@@ -597,7 +658,6 @@ for _, strategy in helpers.each_strategy() do
         local body = cjson.decode(assert.res_status(200, res))
         assert.equal('bob', body.headers["x-consumer-username"])
         assert.equal(kong_cred.id, body.headers["x-credential-identifier"])
-        assert.equal(nil, body.headers["x-credential-username"])
         assert.is_nil(body.headers["x-anonymous-consumer"])
       end)
       it("works with wrong credentials and anonymous", function()
@@ -611,7 +671,6 @@ for _, strategy in helpers.each_strategy() do
         local body = cjson.decode(assert.res_status(200, res))
         assert.equal('true', body.headers["x-anonymous-consumer"])
         assert.equal(nil, body.headers["x-credential-identifier"])
-        assert.equal(nil, body.headers["x-credential-username"])
         assert.equal('no-body', body.headers["x-consumer-username"])
       end)
       it("works with wrong credentials and username as anonymous", function()
@@ -858,7 +917,7 @@ for _, strategy in helpers.each_strategy() do
 
     describe("auto-expiring keys", function()
       -- Give a bit of time to reduce test flakyness on slow setups
-      local ttl = 4
+      local ttl = 10
       local inserted_at
 
       lazy_setup(function()
@@ -890,6 +949,7 @@ for _, strategy in helpers.each_strategy() do
           consumer = { id = user_jafar.id },
         }, { ttl = ttl })
 
+        ngx.update_time()
         inserted_at = ngx.now()
 
         assert(helpers.start_kong({
@@ -934,5 +994,267 @@ for _, strategy in helpers.each_strategy() do
         assert.res_status(401, res)
       end)
     end)
+  end)
+end
+
+
+for _, strategy in helpers.each_strategy() do
+  describe("Plugin: key-auth (access) [#" .. strategy .. "]", function()
+    lazy_setup(function()
+      local bp = helpers.get_db_utils(strategy, {
+        "routes",
+        "services",
+        "plugins",
+        "consumers",
+        "keyauth_credentials",
+      })
+
+      local consumer = bp.consumers:insert({ username = "bob" })
+      bp.keyauth_credentials:insert({ key = "right", consumer = { id = consumer.id } })
+      local service = bp.services:insert({ path = "/status/200" })
+
+      local r1 = bp.routes:insert({ paths = { "/ttt" }, service = service })
+      local r2 = bp.routes:insert({ paths = { "/ttf" }, service = service })
+      local r3 = bp.routes:insert({ paths = { "/tff" }, service = service })
+      local r4 = bp.routes:insert({ paths = { "/fff" }, service = service })
+      local r5 = bp.routes:insert({ paths = { "/fft" }, service = service })
+      local r6 = bp.routes:insert({ paths = { "/tft" }, service = service })
+      local r7 = bp.routes:insert({ paths = { "/ftf" }, service = service })
+
+      bp.plugins:insert({ name = "key-auth", route = r1, config = {
+        key_in_header = true,  key_in_query = true,  key_in_body = true }
+                        })
+      bp.plugins:insert({ name = "key-auth", route = r2, config = {
+        key_in_header = true,  key_in_query = true,  key_in_body = false }
+                        })
+      bp.plugins:insert({ name = "key-auth", route = r3, config = {
+        key_in_header = true,  key_in_query = false, key_in_body = false }
+                        })
+      bp.plugins:insert({ name = "key-auth", route = r4, config = {
+        key_in_header = false, key_in_query = false, key_in_body = false
+      }})
+      bp.plugins:insert({ name = "key-auth", route = r5, config = {
+        key_in_header = false, key_in_query = false, key_in_body = true
+      }})
+      bp.plugins:insert({ name = "key-auth", route = r6, config = {
+        key_in_header = true, key_in_query = false, key_in_body = true
+      }})
+      bp.plugins:insert({ name = "key-auth", route = r7, config = {
+        key_in_header = false, key_in_query = true, key_in_body = false
+      }})
+
+      assert(helpers.start_kong({
+        database   = strategy,
+        nginx_conf = "spec/fixtures/custom_nginx.template",
+      }))
+    end)
+
+    lazy_teardown(function()
+      helpers.stop_kong()
+    end)
+
+    local tests = {
+      ---header--query----body-----path----res---
+      { "right", "right", "right", "/ttt", 200 }, -- 1
+      { "right", "right", "right", "/ttf", 200 },
+      { "right", "right", "right", "/tff", 200 },
+      { "right", "right", "right", "/fff", 401 },
+      { "right", "right", "right", "/fft", 200 },
+      { "right", "right", "right", "/tft", 200 },
+      { "right", "right", "right", "/ftf", 200 },
+      { "right", "right", "wrong", "/ttt", 200 }, -- 8
+      { "right", "right", "wrong", "/ttf", 200 },
+      { "right", "right", "wrong", "/tff", 200 },
+      { "right", "right", "wrong", "/fff", 401 },
+      { "right", "right", "wrong", "/fft", 401 },
+      { "right", "right", "wrong", "/tft", 200 },
+      { "right", "right", "wrong", "/ftf", 200 },
+      { "right", "wrong", "wrong", "/ttt", 200 }, -- 15
+      { "right", "wrong", "wrong", "/ttf", 200 },
+      { "right", "wrong", "wrong", "/tff", 200 },
+      { "right", "wrong", "wrong", "/fff", 401 },
+      { "right", "wrong", "wrong", "/fft", 401 },
+      { "right", "wrong", "wrong", "/tft", 200 },
+      { "right", "wrong", "wrong", "/ftf", 401 },
+      { "wrong", "wrong", "wrong", "/ttt", 401 }, -- 22
+      { "wrong", "wrong", "wrong", "/ttf", 401 },
+      { "wrong", "wrong", "wrong", "/tff", 401 },
+      { "wrong", "wrong", "wrong", "/fff", 401 },
+      { "wrong", "wrong", "wrong", "/fft", 401 },
+      { "wrong", "wrong", "wrong", "/tft", 401 },
+      { "wrong", "wrong", "wrong", "/ftf", 401 },
+      { "wrong", "wrong", "right", "/ttt", 401 }, -- 29
+      { "wrong", "wrong", "right", "/ttf", 401 },
+      { "wrong", "wrong", "right", "/tff", 401 },
+      { "wrong", "wrong", "right", "/fff", 401 },
+      { "wrong", "wrong", "right", "/fft", 200 },
+      { "wrong", "wrong", "right", "/tft", 401 },
+      { "wrong", "wrong", "right", "/ftf", 401 },
+      { "right", "wrong", "right", "/ttt", 200 }, -- 36
+      { "right", "wrong", "right", "/ttf", 200 },
+      { "right", "wrong", "right", "/tff", 200 },
+      { "right", "wrong", "right", "/fff", 401 },
+      { "right", "wrong", "right", "/fft", 200 },
+      { "right", "wrong", "right", "/tft", 200 },
+      { "right", "wrong", "right", "/ftf", 401 },
+      { "wrong", "right", "wrong", "/ttt", 401 }, -- 43
+      { "wrong", "right", "wrong", "/ttf", 401 },
+      { "wrong", "right", "wrong", "/tff", 401 },
+      { "wrong", "right", "wrong", "/fff", 401 },
+      { "wrong", "right", "wrong", "/fft", 401 },
+      { "wrong", "right", "wrong", "/tft", 401 },
+      { "wrong", "right", "wrong", "/ftf", 200 },
+      { nil,     nil,     nil,     "/ttt", 401 }, -- 50
+      { nil,     nil,     nil,     "/ttf", 401 },
+      { nil,     nil,     nil,     "/tff", 401 },
+      { nil,     nil,     nil,     "/fff", 401 },
+      { nil,     nil,     nil,     "/fft", 401 },
+      { nil,     nil,     nil,     "/tft", 401 },
+      { nil,     nil,     nil,     "/ftf", 401 },
+      { nil,     nil,     "wrong", "/ttt", 401 }, -- 57
+      { nil,     nil,     "wrong", "/ttf", 401 },
+      { nil,     nil,     "wrong", "/tff", 401 },
+      { nil,     nil,     "wrong", "/fff", 401 },
+      { nil,     nil,     "wrong", "/fft", 401 },
+      { nil,     nil,     "wrong", "/tft", 401 },
+      { nil,     nil,     "wrong", "/ftf", 401 },
+      { nil,     "wrong", "wrong", "/ttt", 401 }, -- 64
+      { nil,     "wrong", "wrong", "/ttf", 401 },
+      { nil,     "wrong", "wrong", "/tff", 401 },
+      { nil,     "wrong", "wrong", "/fff", 401 },
+      { nil,     "wrong", "wrong", "/fft", 401 },
+      { nil,     "wrong", "wrong", "/tft", 401 },
+      { nil,     "wrong", "wrong", "/ftf", 401 },
+      { "wrong", "wrong", nil,     "/ttt", 401 }, -- 71
+      { "wrong", "wrong", nil,     "/ttf", 401 },
+      { "wrong", "wrong", nil,     "/tff", 401 },
+      { "wrong", "wrong", nil,     "/fff", 401 },
+      { "wrong", "wrong", nil,     "/fft", 401 },
+      { "wrong", "wrong", nil,     "/tft", 401 },
+      { "wrong", "wrong", nil,     "/ftf", 401 },
+      { nil,     "wrong", nil,     "/ttt", 401 }, -- 78
+      { nil,     "wrong", nil,     "/ttf", 401 },
+      { nil,     "wrong", nil,     "/tff", 401 },
+      { nil,     "wrong", nil,     "/fff", 401 },
+      { nil,     "wrong", nil,     "/fft", 401 },
+      { nil,     "wrong", nil,     "/tft", 401 },
+      { nil,     "wrong", nil,     "/ftf", 401 },
+      { "wrong", nil,     "wrong", "/ttt", 401 }, -- 85
+      { "wrong", nil,     "wrong", "/ttf", 401 },
+      { "wrong", nil,     "wrong", "/tff", 401 },
+      { "wrong", nil,     "wrong", "/fff", 401 },
+      { "wrong", nil,     "wrong", "/fft", 401 },
+      { "wrong", nil,     "wrong", "/tft", 401 },
+      { "wrong", nil,     "wrong", "/ftf", 401 },
+      { "right", "right", nil,     "/ttt", 200 }, -- 92
+      { "right", "right", nil,     "/ttf", 200 },
+      { "right", "right", nil,     "/tff", 200 },
+      { "right", "right", nil,     "/fff", 401 },
+      { "right", "right", nil,     "/fft", 401 },
+      { "right", "right", nil,     "/tft", 200 },
+      { "right", "right", nil,     "/ftf", 200 },
+      { "right", nil,     nil,     "/ttt", 200 }, -- 99
+      { "right", nil,     nil,     "/ttf", 200 },
+      { "right", nil,     nil,     "/tff", 200 },
+      { "right", nil,     nil,     "/fff", 401 },
+      { "right", nil,     nil,     "/fft", 401 },
+      { "right", nil,     nil,     "/tft", 200 },
+      { "right", nil,     nil,     "/ftf", 401 },
+      { nil,     nil,     "right", "/ttt", 200 }, -- 106
+      { nil,     nil,     "right", "/ttf", 401 },
+      { nil,     nil,     "right", "/tff", 401 },
+      { nil,     nil,     "right", "/fff", 401 },
+      { nil,     nil,     "right", "/fft", 200 },
+      { nil,     nil,     "right", "/tft", 200 },
+      { nil,     nil,     "right", "/ftf", 401 },
+      { "right", nil,     "right", "/ttt", 200 }, -- 113
+      { "right", nil,     "right", "/ttf", 200 },
+      { "right", nil,     "right", "/tff", 200 },
+      { "right", nil,     "right", "/fff", 401 },
+      { "right", nil,     "right", "/fft", 200 },
+      { "right", nil,     "right", "/tft", 200 },
+      { "right", nil,     "right", "/ftf", 401 },
+      { nil,     "right", nil,     "/ttt", 200 }, -- 120
+      { nil,     "right", nil,     "/ttf", 200 },
+      { nil,     "right", nil,     "/tff", 401 },
+      { nil,     "right", nil,     "/fff", 401 },
+      { nil,     "right", nil,     "/fft", 401 },
+      { nil,     "right", nil,     "/tft", 401 },
+      { nil,     "right", nil,     "/ftf", 200 },
+      { nil,     "right", "wrong", "/ttt", 200 }, -- 127
+      { nil,     "right", "wrong", "/ttf", 200 },
+      { nil,     "right", "wrong", "/tff", 401 },
+      { nil,     "right", "wrong", "/fff", 401 },
+      { nil,     "right", "wrong", "/fft", 401 },
+      { nil,     "right", "wrong", "/tft", 401 },
+      { nil,     "right", "wrong", "/ftf", 200 },
+      { "right", "wrong", nil,     "/ttt", 200 }, -- 134
+      { "right", "wrong", nil,     "/ttf", 200 },
+      { "right", "wrong", nil,     "/tff", 200 },
+      { "right", "wrong", nil,     "/fff", 401 },
+      { "right", "wrong", nil,     "/fft", 401 },
+      { "right", "wrong", nil,     "/tft", 200 },
+      { "right", "wrong", nil,     "/ftf", 401 },
+      { "right", nil,     "wrong", "/ttt", 200 }, -- 141
+      { "right", nil,     "wrong", "/ttf", 200 },
+      { "right", nil,     "wrong", "/tff", 200 },
+      { "right", nil,     "wrong", "/fff", 401 },
+      { "right", nil,     "wrong", "/fft", 401 },
+      { "right", nil,     "wrong", "/tft", 200 },
+      { "right", nil,     "wrong", "/ftf", 401 },
+      { nil,     "wrong", "right", "/ttt", 401 }, -- 148
+      { nil,     "wrong", "right", "/ttf", 401 },
+      { nil,     "wrong", "right", "/tff", 401 },
+      { nil,     "wrong", "right", "/fff", 401 },
+      { nil,     "wrong", "right", "/fft", 200 },
+      { nil,     "wrong", "right", "/tft", 200 },
+      { nil,     "wrong", "right", "/ftf", 401 },
+      { "wrong", "right", nil,     "/ttt", 401 }, -- 155
+      { "wrong", "right", nil,     "/ttf", 401 },
+      { "wrong", "right", nil,     "/tff", 401 },
+      { "wrong", "right", nil,     "/fff", 401 },
+      { "wrong", "right", nil,     "/fft", 401 },
+      { "wrong", "right", nil,     "/tft", 401 },
+      { "wrong", "right", nil,     "/ftf", 200 },
+      { "wrong", nil,     "right", "/ttt", 401 }, -- 162
+      { "wrong", nil,     "right", "/ttf", 401 },
+      { "wrong", nil,     "right", "/tff", 401 },
+      { "wrong", nil,     "right", "/fff", 401 },
+      { "wrong", nil,     "right", "/fft", 200 },
+      { "wrong", nil,     "right", "/tft", 401 },
+      { "wrong", nil,     "right", "/ftf", 401 },
+    }
+
+    for i, test in ipairs(tests) do
+      local header = test[1]
+      local query = ""
+      if test[2] then
+        query = "?apikey=" .. test[2]
+      end
+
+      local body
+      if test[3] then
+        body = "apikey=" .. test[3]
+      end
+
+      local path = test[4]
+
+      local input = string.sub(test[1] or "n", 1, 1) ..
+                    string.sub(test[2] or "n", 1, 1) ..
+                    string.sub(test[3] or "n", 1, 1)
+
+      it("combination #" .. i .. " (" .. input .. " => " .. string.sub(path, 2) .. ") works", function()
+        local proxy_client = helpers.proxy_client()
+        local res = proxy_client:post(path .. query, {
+          body = body,
+          headers = {
+            ["Content-Type"] = "application/x-www-form-urlencoded",
+            ["apikey"] = header,
+          },
+        })
+        assert.res_status(test[5], res)
+        proxy_client:close()
+      end)
+    end
   end)
 end

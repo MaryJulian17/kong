@@ -11,8 +11,8 @@ lua_socket_log_errors  off;
 lua_max_running_timers 4096;
 lua_max_pending_timers 16384;
 lua_ssl_verify_depth   ${{LUA_SSL_VERIFY_DEPTH}};
-> if lua_ssl_trusted_certificate then
-lua_ssl_trusted_certificate '${{LUA_SSL_TRUSTED_CERTIFICATE}}';
+> if lua_ssl_trusted_certificate_combined then
+lua_ssl_trusted_certificate '${{LUA_SSL_TRUSTED_CERTIFICATE_COMBINED}}';
 > end
 
 lua_shared_dict stream_kong                        5m;
@@ -25,12 +25,6 @@ lua_shared_dict stream_kong_core_db_cache          ${{MEM_CACHE_SIZE}};
 lua_shared_dict stream_kong_core_db_cache_miss     12m;
 lua_shared_dict stream_kong_db_cache               ${{MEM_CACHE_SIZE}};
 lua_shared_dict stream_kong_db_cache_miss          12m;
-> if database == "off" then
-lua_shared_dict stream_kong_core_db_cache_2        ${{MEM_CACHE_SIZE}};
-lua_shared_dict stream_kong_core_db_cache_miss_2   12m;
-lua_shared_dict stream_kong_db_cache_2             ${{MEM_CACHE_SIZE}};
-lua_shared_dict stream_kong_db_cache_miss_2        12m;
-> end
 > if database == "cassandra" then
 lua_shared_dict stream_kong_cassandra              5m;
 > end
@@ -47,9 +41,21 @@ $(el.name) $(el.value);
 init_by_lua_block {
     -- shared dictionaries conflict between stream/http modules. use a prefix.
     local shared = ngx.shared
+    local stream_shdict_prefix = "stream_"
     ngx.shared = setmetatable({}, {
+        __pairs = function()
+            local i
+            return function()
+                local k, v = next(shared, i)
+                i = k
+                if k and k:sub(1, #stream_shdict_prefix) == stream_shdict_prefix then
+                    k = k:sub(#stream_shdict_prefix + 1)
+                end
+                return k, v
+            end
+        end,
         __index = function(t, k)
-            return shared["stream_" .. k]
+            return shared[stream_shdict_prefix .. k]
         end,
     })
 
@@ -74,21 +80,25 @@ upstream kong_upstream {
 }
 
 > if #stream_listeners > 0 then
+# non-SSL listeners, and the SSL terminator
 server {
 > for _, entry in ipairs(stream_listeners) do
+> if not entry.ssl then
     listen $(entry.listener);
 > end
-
-> if proxy_access_log == "off" then
-    access_log off;
-> else
-    access_log ${{PROXY_ACCESS_LOG}} basic;
 > end
-    error_log  ${{PROXY_ERROR_LOG}} ${{LOG_LEVEL}};
+
+> if stream_proxy_ssl_enabled then
+    listen unix:${{PREFIX}}/stream_tls_terminate.sock ssl proxy_protocol;
+> end
+
+    access_log ${{PROXY_STREAM_ACCESS_LOG}};
+    error_log ${{PROXY_STREAM_ERROR_LOG}} ${{LOG_LEVEL}};
 
 > for _, ip in ipairs(trusted_ips) do
     set_real_ip_from $(ip);
 > end
+    set_real_ip_from unix:;
 
     # injected nginx_sproxy_* directives
 > for _, el in ipairs(nginx_sproxy_directives) do
@@ -96,17 +106,21 @@ server {
 > end
 
 > if stream_proxy_ssl_enabled then
-    ssl_certificate     ${{SSL_CERT}};
-    ssl_certificate_key ${{SSL_CERT_KEY}};
+> for i = 1, #ssl_cert do
+    ssl_certificate     $(ssl_cert[i]);
+    ssl_certificate_key $(ssl_cert_key[i]);
+> end
     ssl_session_cache   shared:StreamSSL:10m;
     ssl_certificate_by_lua_block {
         Kong.ssl_certificate()
     }
 > end
 
+    set $tls_sni_name 'kong_upstream';
     preread_by_lua_block {
         Kong.preread()
     }
+    proxy_ssl_name $tls_sni_name;
 
     proxy_ssl on;
     proxy_ssl_server_name on;
@@ -121,6 +135,69 @@ server {
     }
 }
 
+> if stream_proxy_ssl_enabled then
+# SSL listeners, but only preread the handshake here
+server {
+> for _, entry in ipairs(stream_listeners) do
+> if entry.ssl then
+    listen $(entry.listener:gsub(" ssl", ""));
+> end
+> end
+
+    access_log ${{PROXY_STREAM_ACCESS_LOG}};
+    error_log ${{PROXY_STREAM_ERROR_LOG}} ${{LOG_LEVEL}};
+
+> for _, ip in ipairs(trusted_ips) do
+    set_real_ip_from $(ip);
+> end
+
+    # injected nginx_sproxy_* directives
+> for _, el in ipairs(nginx_sproxy_directives) do
+    $(el.name) $(el.value);
+> end
+
+    preread_by_lua_block {
+        Kong.preread()
+    }
+
+    ssl_preread on;
+
+    proxy_protocol on;
+
+    set $kong_tls_preread_block 1;
+    set $kong_tls_preread_block_upstream '';
+    proxy_pass $kong_tls_preread_block_upstream;
+}
+
+server {
+    listen unix:${{PREFIX}}/stream_tls_passthrough.sock proxy_protocol;
+
+    access_log ${{PROXY_STREAM_ACCESS_LOG}};
+    error_log ${{PROXY_STREAM_ERROR_LOG}} ${{LOG_LEVEL}};
+
+    set_real_ip_from unix:;
+
+    # injected nginx_sproxy_* directives
+> for _, el in ipairs(nginx_sproxy_directives) do
+    $(el.name) $(el.value);
+> end
+
+    preread_by_lua_block {
+        Kong.preread()
+    }
+
+    ssl_preread on;
+
+    set $kong_tls_passthrough_block 1;
+
+    proxy_pass kong_upstream;
+
+    log_by_lua_block {
+        Kong.log()
+    }
+}
+> end -- stream_proxy_ssl_enabled
+
 > if database == "off" then
 server {
     listen unix:${{PREFIX}}/stream_config.sock;
@@ -132,5 +209,24 @@ server {
     }
 }
 > end -- database == "off"
+
+server {        # ignore (and close }, to ignore content)
+    listen unix:${{PREFIX}}/stream_rpc.sock;
+    error_log  ${{ADMIN_ERROR_LOG}} ${{LOG_LEVEL}};
+    content_by_lua_block {
+        Kong.stream_api()
+    }
+}
 > end -- #stream_listeners > 0
+
+> if not legacy_worker_events then
+server {
+    listen unix:${{PREFIX}}/stream_worker_events.sock;
+    error_log  ${{ADMIN_ERROR_LOG}} ${{LOG_LEVEL}};
+    access_log off;
+    content_by_lua_block {
+      require("resty.events.compat").run()
+    }
+}
+> end -- not legacy_worker_events
 ]]

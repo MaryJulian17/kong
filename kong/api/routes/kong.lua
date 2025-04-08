@@ -1,20 +1,18 @@
-local utils = require "kong.tools.utils"
-local singletons = require "kong.singletons"
-local conf_loader = require "kong.conf_loader"
 local cjson = require "cjson"
 local api_helpers = require "kong.api.api_helpers"
 local Schema = require "kong.db.schema"
 local Errors = require "kong.db.errors"
+local process = require "ngx.process"
 
-local sub = string.sub
 local kong = kong
+local meta = require "kong.meta"
 local knode  = (kong and kong.node) and kong.node or
                require "kong.pdk.node".new()
 local errors = Errors.new()
 
 
 local tagline = "Welcome to " .. _KONG._NAME
-local version = _KONG._VERSION
+local version = meta.version
 local lua_version = jit and jit.version or _VERSION
 
 
@@ -29,11 +27,29 @@ local strip_foreign_schemas = function(fields)
 end
 
 
+local function validate_schema(db_entity_name, params)
+  local entity = kong.db[db_entity_name]
+  local schema = entity and entity.schema or nil
+  if not schema then
+    return kong.response.exit(404, { message = "No entity named '"
+                              .. db_entity_name .. "'" })
+  end
+  local schema = assert(Schema.new(schema))
+  local _, err_t = schema:validate(schema:process_auto_fields(params, "insert"))
+  if err_t then
+    return kong.response.exit(400, errors:schema_violation(err_t))
+  end
+  return kong.response.exit(200, { message = "schema validation successful" })
+end
+
+
 return {
   ["/"] = {
     GET = function(self, dao, helpers)
       local distinct_plugins = setmetatable({}, cjson.array_mt)
-      local prng_seeds = {}
+      local pids = {
+        master = process.get_master_pid()
+      }
 
       do
         local set = {}
@@ -52,18 +68,19 @@ return {
 
       do
         local kong_shm = ngx.shared.kong
-        local shm_prefix = "pid: "
-        local keys, err = kong_shm:get_keys()
-        if not keys then
-          ngx.log(ngx.ERR, "could not get kong shm keys: ", err)
-        else
-          for i = 1, #keys do
-            if sub(keys[i], 1, #shm_prefix) == shm_prefix then
-              prng_seeds[keys[i]], err = kong_shm:get(keys[i])
-              if err then
-                ngx.log(ngx.ERR, "could not get PRNG seed from kong shm")
-              end
+        local worker_count = ngx.worker.count() - 1
+        for i = 0, worker_count do
+          local worker_pid, err = kong_shm:get("pids:" .. i)
+          if not worker_pid then
+            err = err or "not found"
+            ngx.log(ngx.ERR, "could not get worker process id for worker #", i , ": ", err)
+
+          else
+            if not pids.workers then
+              pids.workers = {}
             end
+
+            pids.workers[i + 1] = worker_pid
           end
         end
       end
@@ -73,22 +90,30 @@ return {
         ngx.log(ngx.ERR, "could not get node id: ", err)
       end
 
+      local available_plugins = {}
+      for name in pairs(kong.configuration.loaded_plugins) do
+        available_plugins[name] = {
+          version = kong.db.plugins.handlers[name].VERSION,
+          priority = kong.db.plugins.handlers[name].PRIORITY,
+        }
+      end
+
       return kong.response.exit(200, {
         tagline = tagline,
         version = version,
-        hostname = utils.get_hostname(),
+        hostname = knode.get_hostname(),
         node_id = node_id,
         timers = {
           running = ngx.timer.running_count(),
-          pending = ngx.timer.pending_count()
+          pending = ngx.timer.pending_count(),
         },
         plugins = {
-          available_on_server = singletons.configuration.loaded_plugins,
-          enabled_in_cluster = distinct_plugins
+          available_on_server = available_plugins,
+          enabled_in_cluster = distinct_plugins,
         },
         lua_version = lua_version,
-        configuration = conf_loader.remove_sensitive(singletons.configuration),
-        prng_seeds = prng_seeds,
+        configuration = kong.configuration.remove_sensitive(),
+        pids = pids,
       })
     end
   },
@@ -135,24 +160,17 @@ return {
       return kong.response.exit(200, copy)
     end
   },
+  ["/schemas/plugins/validate"] = {
+    POST = function(self, db, helpers)
+      return validate_schema("plugins", self.params)
+    end
+  },
   ["/schemas/:db_entity_name/validate"] = {
     POST = function(self, db, helpers)
       local db_entity_name = self.params.db_entity_name
       -- What happens when db_entity_name is a field name in the schema?
       self.params.db_entity_name = nil
-      local entity = kong.db[db_entity_name]
-      local schema = entity and entity.schema or nil
-      if not schema then
-        return kong.response.exit(404, { message = "No entity named '"
-                                  .. db_entity_name .. "'" })
-      end
-      local schema = assert(Schema.new(schema))
-      local _, err_t = schema:validate(schema:process_auto_fields(
-                                        self.params, "insert"))
-      if err_t then
-        return kong.response.exit(400, errors:schema_violation(err_t))
-      end
-      return kong.response.exit(200, { message = "schema validation successful" })
+      return validate_schema(db_entity_name, self.params)
     end
   },
   ["/schemas/plugins/:name"] = {
@@ -168,4 +186,19 @@ return {
       return kong.response.exit(200, copy)
     end
   },
+  ["/timers"] = {
+    GET = function (self, db, helpers)
+      local body = {
+        worker = {
+          id = ngx.worker.id(),
+          count = ngx.worker.count(),
+        },
+        stats = kong.timer:stats({
+          verbose = true,
+          flamegraph = true,
+        })
+      }
+      return kong.response.exit(200, body)
+    end
+  }
 }

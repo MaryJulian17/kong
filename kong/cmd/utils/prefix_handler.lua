@@ -1,6 +1,8 @@
 local default_nginx_template = require "kong.templates.nginx"
 local kong_nginx_template = require "kong.templates.nginx_kong"
 local kong_nginx_stream_template = require "kong.templates.nginx_kong_stream"
+local system_constants = require "lua_system_constants"
+local process_secrets = require "kong.cmd.utils.process_secrets"
 local openssl_bignum = require "resty.openssl.bn"
 local openssl_rand = require "resty.openssl.rand"
 local openssl_pkey = require "resty.openssl.pkey"
@@ -19,6 +21,72 @@ local ffi = require "ffi"
 local bit = require "bit"
 local nginx_signals = require "kong.cmd.utils.nginx_signals"
 
+
+local getmetatable = getmetatable
+local tonumber = tonumber
+local tostring = tostring
+local assert = assert
+local string = string
+local ipairs = ipairs
+local pairs = pairs
+local table = table
+local type = type
+local math = math
+local io = io
+local os = os
+
+
+local function pre_create_private_file(file)
+  local flags = bit.bor(system_constants.O_RDONLY(),
+                        system_constants.O_CREAT())
+
+  local mode = ffi.new("int", bit.bor(system_constants.S_IRUSR(),
+                                      system_constants.S_IWUSR()))
+
+  local fd = ffi.C.open(file, flags, mode)
+  if fd == -1 then
+    log.warn("unable to pre-create '", file ,"' file: ",
+             ffi.string(ffi.C.strerror(ffi.errno())))
+
+  else
+    ffi.C.close(fd)
+  end
+end
+
+
+local function gen_default_dhparams(kong_config)
+  for _, name in ipairs({ kong_config.nginx_http_ssl_dhparam, kong_config.nginx_stream_ssl_dhparam }) do
+    local pem
+    if name then
+      pem = openssl_pkey.paramgen({
+        type = "DH",
+        group = name,
+      })
+    end
+
+    if pem then
+      local ssl_path = pl_path.join(kong_config.prefix, "ssl")
+      if not pl_path.exists(ssl_path) then
+        local ok, err = pl_dir.makepath(ssl_path)
+        if not ok then
+          return nil, err
+        end
+      end
+
+      local param_file = pl_path.join(ssl_path, name .. ".pem")
+      if not pl_path.exists(param_file) then
+        log.verbose("generating %s DH parameters", name)
+        local fd = assert(io.open(param_file, "w+b"))
+        assert(fd:write(pem))
+        fd:close()
+      end
+    end
+  end
+
+  return true
+end
+
+
 local function gen_default_ssl_cert(kong_config, target)
   -- create SSL folder
   local ok, err = pl_dir.makepath(pl_path.join(kong_config.prefix, "ssl"))
@@ -26,82 +94,107 @@ local function gen_default_ssl_cert(kong_config, target)
     return nil, err
   end
 
-  local ssl_cert, ssl_cert_key
-  if target == "admin" then
-    ssl_cert = kong_config.admin_ssl_cert_default
-    ssl_cert_key = kong_config.admin_ssl_cert_key_default
+  for _, suffix in ipairs({ "", "_ecdsa" }) do
+    local ssl_cert, ssl_cert_key
+    if target == "admin" then
+      ssl_cert = kong_config["admin_ssl_cert_default" .. suffix]
+      ssl_cert_key = kong_config["admin_ssl_cert_key_default" .. suffix]
 
-  elseif target == "status" then
-    ssl_cert = kong_config.status_ssl_cert_default
-    ssl_cert_key = kong_config.status_ssl_cert_key_default
+    elseif target == "status" then
+      ssl_cert = kong_config["status_ssl_cert_default" .. suffix]
+      ssl_cert_key = kong_config["status_ssl_cert_key_default" .. suffix]
 
-  else
-    ssl_cert = kong_config.ssl_cert_default
-    ssl_cert_key = kong_config.ssl_cert_key_default
-  end
-
-  if not pl_path.exists(ssl_cert) and not pl_path.exists(ssl_cert_key) then
-    log.verbose("generating %s SSL certificate and key", target or "default")
-
-    local key = openssl_pkey.new { bits = 2048 }
-
-    local crt = x509.new()
-    assert(crt:set_pubkey(key))
-    assert(crt:set_version(3))
-    assert(crt:set_serial_number(openssl_bignum.from_binary(openssl_rand.bytes(16))))
-
-    -- last for 20 years
-    local now = os.time()
-    assert(crt:set_not_before(now))
-    assert(crt:set_not_after(now + 86400 * 20 * 365))
-
-    local name = assert(x509_name.new()
-      :add("C", "US")
-      :add("ST", "California")
-      :add("L", "San Francisco")
-      :add("O", "Kong")
-      :add("OU", "IT Department")
-      :add("CN", "localhost"))
-
-    assert(crt:set_subject_name(name))
-    assert(crt:set_issuer_name(name))
-
-    -- Not a CA
-    assert(crt:set_basic_constraints { CA = false })
-    assert(crt:set_basic_constraints_critical(true))
-
-    -- Only allowed to be used for TLS connections (client or server)
-    assert(crt:add_extension(x509_extension.new("extendedKeyUsage",
-                                                "serverAuth,clientAuth")))
-
-    -- RFC-3280 4.2.1.2
-    assert(crt:add_extension(x509_extension.new("subjectKeyIdentifier", "hash", {
-      subject = crt
-    })))
-
-    -- All done; sign
-    assert(crt:sign(key))
-
-    do -- write key out
-      local fd = assert(io.open(ssl_cert_key, "w+b"))
-      local pem = assert(key:to_PEM("private"))
-      assert(fd:write(pem))
-      fd:close()
+    else
+      ssl_cert = kong_config["ssl_cert_default" .. suffix]
+      ssl_cert_key = kong_config["ssl_cert_key_default" .. suffix]
     end
 
-    do -- write cert out
-      local fd = assert(io.open(ssl_cert, "w+b"))
-      local pem = assert(crt:to_PEM("private"))
-      assert(fd:write(pem))
-      fd:close()
-    end
+    if not pl_path.exists(ssl_cert) and not pl_path.exists(ssl_cert_key) then
+      log.verbose("generating %s SSL certificate (", ssl_cert, ") and key (", ssl_cert_key, ") for ", target or "proxy", " listener")
 
-  else
-    log.verbose("%s SSL certificate found at %s", target or "default", ssl_cert)
+      local key
+      if suffix == "_ecdsa" then
+        key = openssl_pkey.new { type = "EC", curve = "prime256v1" }
+      else
+        key = openssl_pkey.new { bits = 2048 }
+      end
+
+      local crt = x509.new()
+      assert(crt:set_pubkey(key))
+      assert(crt:set_version(3))
+      assert(crt:set_serial_number(openssl_bignum.from_binary(openssl_rand.bytes(16))))
+
+      -- last for 20 years
+      local now = os.time()
+      assert(crt:set_not_before(now))
+      assert(crt:set_not_after(now + 86400 * 20 * 365))
+
+      local name = assert(x509_name.new()
+        :add("C", "US")
+        :add("ST", "California")
+        :add("L", "San Francisco")
+        :add("O", "Kong")
+        :add("OU", "IT Department")
+        :add("CN", "localhost"))
+
+      assert(crt:set_subject_name(name))
+      assert(crt:set_issuer_name(name))
+
+      -- Not a CA
+      assert(crt:set_basic_constraints { CA = false })
+      assert(crt:set_basic_constraints_critical(true))
+
+      -- Only allowed to be used for TLS connections (client or server)
+      assert(crt:add_extension(x509_extension.new("extendedKeyUsage",
+                                                  "serverAuth,clientAuth")))
+
+      -- RFC-3280 4.2.1.2
+      assert(crt:add_extension(x509_extension.new("subjectKeyIdentifier", "hash", {
+        subject = crt
+      })))
+
+      -- All done; sign
+      assert(crt:sign(key))
+
+      do -- write key out
+        pre_create_private_file(ssl_cert_key)
+        local fd = assert(io.open(ssl_cert_key, "w+b"))
+        local pem = assert(key:to_PEM("private"))
+        assert(fd:write(pem))
+        fd:close()
+      end
+
+      do -- write cert out
+        local fd = assert(io.open(ssl_cert, "w+b"))
+        local pem = assert(crt:to_PEM())
+        assert(fd:write(pem))
+        fd:close()
+      end
+
+    else
+      log.verbose("%s SSL certificate found at %s", target or "default", ssl_cert)
+    end
   end
 
   return true
 end
+
+
+local function gen_trusted_certs_combined_file(combined_filepath, paths)
+
+  log.verbose("generating trusted certs combined file in ",
+              combined_filepath)
+
+  local fd = assert(io.open(combined_filepath, "w"))
+
+  for _, path in ipairs(paths) do
+    fd:write(assert(pl_file.read(path)))
+    fd:write("\n")
+  end
+
+  io.close(fd)
+end
+
 
 local function get_ulimit()
   local ok, _, stdout, stderr = pl_utils.executeex "ulimit -n"
@@ -122,13 +215,16 @@ local function compile_conf(kong_config, conf_template)
     _escape = ">",
     pairs = pairs,
     ipairs = ipairs,
-    tostring = tostring
+    tostring = tostring,
+    os = {
+      getenv = os.getenv,
+    }
   }
 
   do
     local worker_rlimit_nofile_auto
     if kong_config.nginx_main_directives then
-      for _, directive in pairs(kong_config.nginx_main_directives) do
+      for _, directive in ipairs(kong_config.nginx_main_directives) do
         if directive.name == "worker_rlimit_nofile" then
           if directive.value == "auto" then
             worker_rlimit_nofile_auto = directive
@@ -140,7 +236,7 @@ local function compile_conf(kong_config, conf_template)
 
     local worker_connections_auto
     if kong_config.nginx_events_directives then
-      for _, directive in pairs(kong_config.nginx_events_directives) do
+      for _, directive in ipairs(kong_config.nginx_events_directives) do
         if directive.name == "worker_connections" then
           if directive.value == "auto" then
             worker_connections_auto = directive
@@ -157,6 +253,7 @@ local function compile_conf(kong_config, conf_template)
       end
 
       value = math.min(value, 16384)
+      value = math.max(value, 1024)
 
       if worker_rlimit_nofile_auto then
         worker_rlimit_nofile_auto.value = value
@@ -187,10 +284,13 @@ local function compile_conf(kong_config, conf_template)
 end
 
 local function write_env_file(path, data)
-  local c = require "lua_system_constants"
+  os.remove(path)
 
-  local flags = bit.bor(c.O_CREAT(), c.O_WRONLY())
-  local mode  = bit.bor(c.S_IRUSR(), c.S_IWUSR(), c.S_IRGRP())
+  local flags = bit.bor(system_constants.O_CREAT(),
+                        system_constants.O_WRONLY())
+  local mode = ffi.new("int", bit.bor(system_constants.S_IRUSR(),
+                                      system_constants.S_IWUSR(),
+                                      system_constants.S_IRGRP()))
 
   local fd = ffi.C.open(path, flags, mode)
   if fd < 0 then
@@ -199,11 +299,43 @@ local function write_env_file(path, data)
                 ffi.string(ffi.C.strerror(errno)) .. ")"
   end
 
-  local n  = #data
-  local sz = ffi.C.write(fd, data, n)
-  if sz ~= n then
-    ffi.C.close(fd)
-    return nil, "wrote " .. sz .. " bytes, expected to write " .. n
+  local ok = ffi.C.close(fd)
+  if ok ~= 0 then
+    local errno = ffi.errno()
+    return nil, "failed to close fd (" ..
+                ffi.string(ffi.C.strerror(errno)) .. ")"
+  end
+
+  local file, err = io.open(path, "w+")
+  if not file then
+    return nil, "unable to open env path " .. path .. " (" .. err .. ")"
+  end
+
+  local ok, err = file:write(data)
+
+  file:close()
+
+  if not ok then
+    return nil, "unable to write env path " .. path .. " (" .. err .. ")"
+  end
+
+  return true
+end
+
+local function write_process_secrets_file(path, data)
+  os.remove(path)
+
+  local flags = bit.bor(system_constants.O_RDONLY(),
+                        system_constants.O_CREAT())
+
+  local mode = ffi.new("int", bit.bor(system_constants.S_IRUSR(),
+                                      system_constants.S_IWUSR()))
+
+  local fd = ffi.C.open(path, flags, mode)
+  if fd < 0 then
+    local errno = ffi.errno()
+    return nil, "unable to open process secrets path " .. path .. " (" ..
+                ffi.string(ffi.C.strerror(errno)) .. ")"
   end
 
   local ok = ffi.C.close(fd)
@@ -211,6 +343,19 @@ local function write_env_file(path, data)
     local errno = ffi.errno()
     return nil, "failed to close fd (" ..
                 ffi.string(ffi.C.strerror(errno)) .. ")"
+  end
+
+  local file, err = io.open(path, "w+b")
+  if not file then
+    return nil, "unable to open process secrets path " .. path .. " (" .. err .. ")"
+  end
+
+  local ok, err = file:write(data)
+
+  file:close()
+
+  if not ok then
+    return nil, "unable to write process secrets path " .. path .. " (" .. err .. ")"
   end
 
   return true
@@ -229,7 +374,7 @@ local function compile_nginx_conf(kong_config, template)
   return compile_conf(kong_config, template)
 end
 
-local function prepare_prefix(kong_config, nginx_custom_template_path)
+local function prepare_prefix(kong_config, nginx_custom_template_path, skip_write, write_process_secrets)
   log.verbose("preparing nginx prefix directory at %s", kong_config.prefix)
 
   if not pl_path.exists(kong_config.prefix) then
@@ -271,37 +416,43 @@ local function prepare_prefix(kong_config, nginx_custom_template_path)
   end
 
   -- generate default SSL certs if needed
-  if not kong_config.ssl_cert and not kong_config.ssl_cert_key and
-    (kong_config.proxy_ssl_enabled or kong_config.stream_listeners[1] ~= nil) then
-    log.verbose("SSL enabled, no custom certificate set: using default certificate")
-    local ok, err = gen_default_ssl_cert(kong_config)
-    if not ok then
-      return nil, err
+  do
+    for _, target in ipairs({ "proxy", "admin", "status" }) do
+      local ssl_enabled = kong_config[target .. "_ssl_enabled"]
+      if not ssl_enabled and target == "proxy" then
+        ssl_enabled = kong_config.stream_proxy_ssl_enabled
+      end
+
+      local prefix
+      if target == "proxy" then
+        prefix = ""
+      else
+        prefix = target .. "_"
+      end
+
+      local ssl_cert = kong_config[prefix .. "ssl_cert"]
+      local ssl_cert_key = kong_config[prefix .. "ssl_cert_key"]
+
+      if ssl_enabled and #ssl_cert == 0 and #ssl_cert_key == 0 then
+        log.verbose("SSL enabled on ", target, ", no custom certificate set: using default certificates")
+        local ok, err = gen_default_ssl_cert(kong_config, target)
+        if not ok then
+          return nil, err
+        end
+
+        ssl_cert[1]     = kong_config[prefix .. "ssl_cert_default"]
+        ssl_cert_key[1] = kong_config[prefix .. "ssl_cert_key_default"]
+        ssl_cert[2]     = kong_config[prefix .. "ssl_cert_default_ecdsa"]
+        ssl_cert_key[2] = kong_config[prefix .. "ssl_cert_key_default_ecdsa"]
+      end
     end
-    kong_config.ssl_cert = kong_config.ssl_cert_default
-    kong_config.ssl_cert_key = kong_config.ssl_cert_key_default
   end
 
-  if kong_config.admin_ssl_enabled and not kong_config.admin_ssl_cert and
-     not kong_config.admin_ssl_cert_key then
-    log.verbose("Admin SSL enabled, no custom certificate set: using default certificate")
-    local ok, err = gen_default_ssl_cert(kong_config, "admin")
-    if not ok then
-      return nil, err
-    end
-    kong_config.admin_ssl_cert = kong_config.admin_ssl_cert_default
-    kong_config.admin_ssl_cert_key = kong_config.admin_ssl_cert_key_default
-  end
-
-  if kong_config.status_ssl_enabled and not kong_config.status_ssl_cert and
-     not kong_config.status_ssl_cert_key then
-    log.verbose("Status SSL enabled, no custom certificate set: using default certificate")
-    local ok, err = gen_default_ssl_cert(kong_config, "status")
-    if not ok then
-      return nil, err
-    end
-    kong_config.status_ssl_cert = kong_config.status_ssl_cert_default
-    kong_config.status_ssl_cert_key = kong_config.status_ssl_cert_key_default
+  if kong_config.lua_ssl_trusted_certificate_combined then
+    gen_trusted_certs_combined_file(
+      kong_config.lua_ssl_trusted_certificate_combined,
+      kong_config.lua_ssl_trusted_certificate
+    )
   end
 
   -- check ulimit
@@ -312,13 +463,30 @@ local function prepare_prefix(kong_config, nginx_custom_template_path)
              [[ to at least "4096" using "ulimit -n"]], ulimit)
   end
 
+  if skip_write then
+    return true
+  end
+
   -- compile Nginx configurations
   local nginx_template
   if nginx_custom_template_path then
     if not pl_path.exists(nginx_custom_template_path) then
       return nil, "no such file: " .. nginx_custom_template_path
     end
-    nginx_template = pl_file.read(nginx_custom_template_path)
+    local read_err
+    nginx_template, read_err = pl_file.read(nginx_custom_template_path)
+    if not nginx_template then
+      read_err = tostring(read_err or "unknown error")
+      return nil, "failed reading custom nginx template file: " .. read_err
+    end
+  end
+
+  if kong_config.proxy_ssl_enabled or
+     kong_config.stream_proxy_ssl_enabled or
+     kong_config.admin_ssl_enabled or
+     kong_config.status_ssl_enabled
+  then
+    gen_default_dhparams(kong_config)
   end
 
   -- write NGINX conf
@@ -360,7 +528,19 @@ local function prepare_prefix(kong_config, nginx_custom_template_path)
     "",
   }
 
+  local refs = kong_config["$refs"]
+  local has_refs = refs and type(refs) == "table"
+
+  local secrets
+  if write_process_secrets and has_refs then
+    secrets = process_secrets.extract(kong_config)
+  end
+
   for k, v in pairs(kong_config) do
+    if has_refs and refs[k] then
+      v = refs[k]
+    end
+
     if type(v) == "table" then
       if (getmetatable(v) or {}).__tostring then
         -- the 'tostring' meta-method knows how to serialize
@@ -374,10 +554,25 @@ local function prepare_prefix(kong_config, nginx_custom_template_path)
     end
   end
 
-  local ok, err = write_env_file(kong_config.kong_env,
-                                 table.concat(buf, "\n") .. "\n")
+  local env = table.concat(buf, "\n") .. "\n"
+  local ok, err = write_env_file(kong_config.kong_env, env)
   if not ok then
     return nil, err
+  end
+
+  if secrets then
+    secrets, err = process_secrets.serialize(secrets, kong_config.kong_env)
+    if not secrets then
+      return nil, err
+    end
+
+    ok, err = write_process_secrets_file(kong_config.kong_process_secrets, secrets)
+    if not ok then
+      return nil, err
+    end
+
+  elseif not write_process_secrets then
+    os.remove(kong_config.kong_process_secrets)
   end
 
   return true
@@ -390,5 +585,6 @@ return {
   compile_kong_conf = compile_kong_conf,
   compile_kong_stream_conf = compile_kong_stream_conf,
   compile_nginx_conf = compile_nginx_conf,
-  gen_default_ssl_cert = gen_default_ssl_cert
+  gen_default_ssl_cert = gen_default_ssl_cert,
+  write_env_file = write_env_file,
 }

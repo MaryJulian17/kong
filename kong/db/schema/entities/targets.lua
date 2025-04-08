@@ -5,7 +5,12 @@ local utils = require "kong.tools.utils"
 local function validate_target(target)
   local p = utils.normalize_ip(target)
   if not p then
-    return nil, "Invalid target; not a valid hostname or ip address"
+    local ok = utils.validate_utf8(target)
+    if not ok then
+      return nil, "Invalid target; not a valid hostname or ip address"
+    end
+
+    return nil, "Invalid target ('" .. target .. "'); not a valid hostname or ip address"
   end
   return true
 end
@@ -15,6 +20,7 @@ return {
   name = "targets",
   dao = "kong.db.dao.targets",
   primary_key = { "id" },
+  cache_key = { "upstream", "target" },
   endpoint_key = "target",
   workspaceable = true,
   fields = {

@@ -1,15 +1,9 @@
-local singletons = require "kong.singletons"
 local ngx_ssl = require "ngx.ssl"
 local pl_utils = require "pl.utils"
 local mlcache = require "resty.mlcache"
 local new_tab = require "table.new"
 local openssl_x509_store = require "resty.openssl.x509.store"
 local openssl_x509 = require "resty.openssl.x509"
-
-if jit.arch == 'arm64' then
-  jit.off(mlcache.get_bulk)        -- "temporary" workaround for issue #5748 on ARM
-end
-
 
 
 local ngx_log     = ngx.log
@@ -55,9 +49,25 @@ local function parse_key_and_cert(row)
     return nil, "could not parse PEM private key: " .. err
   end
 
+  local cert_alt
+  local key_alt
+  if row.cert_alt and row.key_alt then
+    cert_alt, err = parse_pem_cert(row.cert_alt)
+    if not cert_alt then
+      return nil, "could not parse alternate PEM certificate: " .. err
+    end
+
+    key_alt, err = parse_pem_priv_key(row.key_alt)
+    if not key_alt then
+      return nil, "could not parse alternate PEM private key: " .. err
+    end
+  end
+
   return {
     cert = cert,
     key = key,
+    cert_alt = cert_alt,
+    key_alt = key_alt,
   }
 end
 
@@ -106,7 +116,7 @@ end
 
 
 local function fetch_sni(sni, i)
-  local row, err = singletons.db.snis:select_by_name(sni)
+  local row, err = kong.db.snis:select_by_name(sni)
   if err then
     return nil, "failed to fetch '" .. sni .. "' SNI: " .. err, i
   end
@@ -120,7 +130,7 @@ end
 
 
 local function fetch_certificate(pk, sni_name)
-  local certificate, err = singletons.db.certificates:select(pk)
+  local certificate, err = kong.db.certificates:select(pk)
   if err then
     if sni_name then
       return nil, "failed to fetch certificate for '" .. sni_name .. "' SNI: " ..
@@ -172,17 +182,21 @@ local get_ca_store_opts = {
 
 
 local function init()
-  default_cert_and_key = parse_key_and_cert {
-    cert = assert(pl_utils.readfile(singletons.configuration.ssl_cert)),
-    key = assert(pl_utils.readfile(singletons.configuration.ssl_cert_key)),
-  }
+  local conf = kong.configuration
+  if conf.ssl_cert[1] then
+    default_cert_and_key = parse_key_and_cert {
+      cert = assert(pl_utils.readfile(conf.ssl_cert[1])),
+      key = assert(pl_utils.readfile(conf.ssl_cert_key[1])),
+    }
+  end
 end
 
 
 local function get_certificate(pk, sni_name)
-  return kong.core_cache:get("certificates:" .. pk.id,
-                        get_certificate_opts, fetch_certificate,
-                        pk, sni_name)
+  local cache_key = kong.db.certificates:cache_key(pk)
+  return kong.core_cache:get(cache_key,
+                             get_certificate_opts, fetch_certificate,
+                             pk, sni_name)
 end
 
 
@@ -262,6 +276,20 @@ local function execute()
   if not ok then
     log(ERR, "could not set configured private key: ", err)
     return ngx.exit(ngx.ERROR)
+  end
+
+  if cert_and_key.cert_alt and cert_and_key.key_alt then
+    ok, err = set_cert(cert_and_key.cert_alt)
+    if not ok then
+      log(ERR, "could not set alternate configured certificate: ", err)
+      return ngx.exit(ngx.ERROR)
+    end
+
+    ok, err = set_priv_key(cert_and_key.key_alt)
+    if not ok then
+      log(ERR, "could not set alternate configured private key: ", err)
+      return ngx.exit(ngx.ERROR)
+    end
   end
 end
 

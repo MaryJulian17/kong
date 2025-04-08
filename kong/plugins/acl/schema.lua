@@ -11,16 +11,7 @@ return {
         fields = {
           { allow = { type = "array", elements = { type = "string" }, }, },
           { deny = { type = "array", elements = { type = "string" }, }, },
-          { hide_groups_header = { type = "boolean", default = false }, },
-        },
-        shorthands = {
-          -- deprecated forms, to be removed in Kong 3.0
-          { blacklist = function(value)
-              return { deny = value }
-            end },
-          { whitelist = function(value)
-              return { allow = value }
-            end },
+          { hide_groups_header = { type = "boolean", required = true, default = false }, },
         },
       }
     }

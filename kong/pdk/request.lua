@@ -1,6 +1,7 @@
---- Client request module
--- A set of functions to retrieve information about the incoming requests made
--- by clients.
+--- Client request module.
+--
+-- This module provides a set of functions to retrieve information about the
+-- incoming requests made by clients.
 --
 -- @module kong.request
 
@@ -8,9 +9,12 @@
 local cjson = require "cjson.safe".new()
 local multipart = require "multipart"
 local phase_checker = require "kong.pdk.private.phases"
+local normalize = require("kong.tools.uri").normalize
 
 
 local ngx = ngx
+local var = ngx.var
+local req = ngx.req
 local sub = string.sub
 local find = string.find
 local lower = string.lower
@@ -54,16 +58,17 @@ local function new(self)
   local X_FORWARDED_PROTO      = "X-Forwarded-Proto"
   local X_FORWARDED_HOST       = "X-Forwarded-Host"
   local X_FORWARDED_PORT       = "X-Forwarded-Port"
+  local X_FORWARDED_PATH       = "X-Forwarded-Path"
   local X_FORWARDED_PREFIX     = "X-Forwarded-Prefix"
 
 
   ---
   -- Returns the scheme component of the request's URL. The returned value is
-  -- normalized to lower-case form.
+  -- normalized to lowercase form.
   --
   -- @function kong.request.get_scheme
-  -- @phases rewrite, access, header_filter, body_filter, log, admin_api
-  -- @treturn string a string like `"http"` or `"https"`
+  -- @phases rewrite, access, header_filter, response, body_filter, log, admin_api
+  -- @treturn string A string like `"http"` or `"https"`.
   -- @usage
   -- -- Given a request to https://example.com:1234/v1/movies
   --
@@ -71,17 +76,17 @@ local function new(self)
   function _REQUEST.get_scheme()
     check_phase(PHASES.request)
 
-    return ngx.var.scheme
+    return var.scheme
   end
 
 
   ---
   -- Returns the host component of the request's URL, or the value of the
-  -- "Host" header. The returned value is normalized to lower-case form.
+  -- "Host" header. The returned value is normalized to lowercase form.
   --
   -- @function kong.request.get_host
-  -- @phases rewrite, access, header_filter, body_filter, log, admin_api
-  -- @treturn string the host
+  -- @phases rewrite, access, header_filter, response, body_filter, log, admin_api
+  -- @treturn string The hostname.
   -- @usage
   -- -- Given a request to https://example.com:1234/v1/movies
   --
@@ -89,7 +94,7 @@ local function new(self)
   function _REQUEST.get_host()
     check_phase(PHASES.request)
 
-    return ngx.var.host
+    return var.host
   end
 
 
@@ -98,8 +103,8 @@ local function new(self)
   -- as a Lua number.
   --
   -- @function kong.request.get_port
-  -- @phases certificate, rewrite, access, header_filter, body_filter, log, admin_api
-  -- @treturn number the port
+  -- @phases certificate, rewrite, access, header_filter, response, body_filter, log, admin_api
+  -- @treturn number The port.
   -- @usage
   -- -- Given a request to https://example.com:1234/v1/movies
   --
@@ -107,28 +112,28 @@ local function new(self)
   function _REQUEST.get_port()
     check_not_phase(PHASES.init_worker)
 
-    return tonumber(ngx.var.server_port)
+    return tonumber(var.server_port)
   end
 
 
   ---
   -- Returns the scheme component of the request's URL, but also considers
   -- `X-Forwarded-Proto` if it comes from a trusted source. The returned
-  -- value is normalized to lower-case.
+  -- value is normalized to lowercase.
   --
   -- Whether this function considers `X-Forwarded-Proto` or not depends on
   -- several Kong configuration parameters:
   --
-  -- * [trusted\_ips](https://getkong.org/docs/latest/configuration/#trusted_ips)
-  -- * [real\_ip\_header](https://getkong.org/docs/latest/configuration/#real_ip_header)
-  -- * [real\_ip\_recursive](https://getkong.org/docs/latest/configuration/#real_ip_recursive)
+  -- * [trusted\_ips](https://docs.konghq.com/gateway/latest/reference/configuration/#trusted_ips)
+  -- * [real\_ip\_header](https://docs.konghq.com/gateway/latest/reference/configuration/#real_ip_header)
+  -- * [real\_ip\_recursive](https://docs.konghq.com/gateway/latest/reference/configuration/#real_ip_recursive)
   --
-  -- **Note**: support for the Forwarded HTTP Extension (RFC 7239) is not
-  -- offered yet since it is not supported by ngx\_http\_realip\_module.
+  -- **Note**: Kong does not offer support for the Forwarded HTTP Extension
+  -- (RFC 7239) since it is not supported by ngx_http_realip_module.
   --
   -- @function kong.request.get_forwarded_scheme
-  -- @phases rewrite, access, header_filter, body_filter, log, admin_api
-  -- @treturn string the forwarded scheme
+  -- @phases rewrite, access, header_filter, response, body_filter, log, admin_api
+  -- @treturn string The forwarded scheme.
   -- @usage
   -- kong.request.get_forwarded_scheme() -- "https"
   function _REQUEST.get_forwarded_scheme()
@@ -147,23 +152,23 @@ local function new(self)
 
   ---
   -- Returns the host component of the request's URL or the value of the "host"
-  -- header. Unlike `kong.request.get_host()`, this function will also consider
+  -- header. Unlike `kong.request.get_host()`, this function also considers
   -- `X-Forwarded-Host` if it comes from a trusted source. The returned value
-  -- is normalized to lower-case.
+  -- is normalized to lowercase.
   --
   -- Whether this function considers `X-Forwarded-Host` or not depends on
   -- several Kong configuration parameters:
   --
-  -- * [trusted\_ips](https://getkong.org/docs/latest/configuration/#trusted_ips)
-  -- * [real\_ip\_header](https://getkong.org/docs/latest/configuration/#real_ip_header)
-  -- * [real\_ip\_recursive](https://getkong.org/docs/latest/configuration/#real_ip_recursive)
+  -- * [trusted\_ips](https://docs.konghq.com/gateway/latest/reference/configuration/#trusted_ips)
+  -- * [real\_ip\_header](https://docs.konghq.com/gateway/latest/reference/configuration/#real_ip_header)
+  -- * [real\_ip\_recursive](https://docs.konghq.com/gateway/latest/reference/configuration/#real_ip_recursive)
   --
-  -- **Note**: we do not currently offer support for Forwarded HTTP Extension
+  -- **Note**: Kong does not offer support for the Forwarded HTTP Extension
   -- (RFC 7239) since it is not supported by ngx_http_realip_module.
   --
   -- @function kong.request.get_forwarded_host
-  -- @phases rewrite, access, header_filter, body_filter, log, admin_api
-  -- @treturn string the forwarded host
+  -- @phases rewrite, access, header_filter, response, body_filter, log, admin_api
+  -- @treturn string The forwarded host.
   -- @usage
   -- kong.request.get_forwarded_host() -- "example.com"
   function _REQUEST.get_forwarded_host()
@@ -194,23 +199,23 @@ local function new(self)
   -- Whether this function considers `X-Forwarded-Proto` or not depends on
   -- several Kong configuration parameters:
   --
-  -- * [trusted\_ips](https://getkong.org/docs/latest/configuration/#trusted_ips)
-  -- * [real\_ip\_header](https://getkong.org/docs/latest/configuration/#real_ip_header)
-  -- * [real\_ip\_recursive](https://getkong.org/docs/latest/configuration/#real_ip_recursive)
+  -- * [trusted\_ips](https://docs.konghq.com/gateway/latest/reference/configuration/#trusted_ips)
+  -- * [real\_ip\_header](https://docs.konghq.com/gateway/latest/reference/configuration/#real_ip_header)
+  -- * [real\_ip\_recursive](https://docs.konghq.com/gateway/latest/reference/configuration/#real_ip_recursive)
   --
-  -- **Note**: we do not currently offer support for Forwarded HTTP Extension
+  -- **Note**: Kong does not offer support for the Forwarded HTTP Extension
   -- (RFC 7239) since it is not supported by ngx_http_realip_module.
   --
-  -- When running Kong behind the L4 port mapping (or forwarding) you can also
+  -- When running Kong behind the L4 port mapping (or forwarding), you can also
   -- configure:
-  -- * [port\_maps](https://getkong.org/docs/latest/configuration/#port_maps)
+  -- * [port\_maps](https://docs.konghq.com/gateway/latest/reference/configuration/#port_maps)
   --
-  -- `port_maps` configuration parameter enables this function to return the
+  -- The `port_maps` configuration parameter enables this function to return the
   -- port to which the port Kong is listening to is mapped to (in case they differ).
   --
   -- @function kong.request.get_forwarded_port
-  -- @phases rewrite, access, header_filter, body_filter, log, admin_api
-  -- @treturn number the forwarded port
+  -- @phases rewrite, access, header_filter, response, body_filter, log, admin_api
+  -- @treturn number The forwarded port.
   -- @usage
   -- kong.request.get_forwarded_port() -- 1234
   function _REQUEST.get_forwarded_port()
@@ -252,36 +257,77 @@ local function new(self)
 
   ---
   -- Returns the path component of the request's URL, but also considers
-  -- `X-Forwarded-Prefix` if it comes from a trusted source. The value
+  -- `X-Forwarded-Path` if it comes from a trusted source. The value
   -- is returned as a Lua string.
   --
-  -- Whether this function considers `X-Forwarded-Prefix` or not depends on
+  -- Whether this function considers `X-Forwarded-Path` or not depends on
   -- several Kong configuration parameters:
   --
-  -- * [trusted\_ips](https://getkong.org/docs/latest/configuration/#trusted_ips)
-  -- * [real\_ip\_header](https://getkong.org/docs/latest/configuration/#real_ip_header)
-  -- * [real\_ip\_recursive](https://getkong.org/docs/latest/configuration/#real_ip_recursive)
+  -- * [trusted\_ips](https://docs.konghq.com/gateway/latest/reference/configuration/#trusted_ips)
+  -- * [real\_ip\_header](https://docs.konghq.com/gateway/latest/reference/configuration/#real_ip_header)
+  -- * [real\_ip\_recursive](https://docs.konghq.com/gateway/latest/reference/configuration/#real_ip_recursive)
   --
-  -- **Note**: we do not currently do any normalization on the request
-  --           path except return `"/"` on empty path.
+  -- **Note**: Kong does not do any normalization on the request path.
   --
   -- @function kong.request.get_forwarded_path
-  -- @phases rewrite, access, header_filter, body_filter, log, admin_api
-  -- @treturn string the forwarded path
+  -- @phases rewrite, access, header_filter, response, body_filter, log, admin_api
+  -- @treturn string The forwarded path.
   -- @usage
   -- kong.request.get_forwarded_path() -- /path
   function _REQUEST.get_forwarded_path()
     check_phase(PHASES.request)
 
     if self.ip.is_trusted(self.client.get_ip()) then
-      local prefix = _REQUEST.get_header(X_FORWARDED_PREFIX)
+      local path = _REQUEST.get_header(X_FORWARDED_PATH)
+      if path then
+        return path
+      end
+    end
+
+    local path = _REQUEST.get_path()
+    return path
+  end
+
+
+  ---
+  -- Returns the prefix path component of the request's URL that Kong stripped
+  -- before proxying to upstream. It also checks if `X-Forwarded-Prefix` comes
+  -- from a trusted source, and uses it as-is when given. The value is returned
+  -- as a Lua string.
+  --
+  -- If a trusted `X-Forwarded-Prefix` is not passed, this function must be
+  -- called after Kong has run its router (`access` phase),
+  -- as the Kong router may strip the prefix of the request path. That stripped
+  -- path becomes the return value of this function, unless there is already
+  -- a trusted `X-Forwarded-Prefix` header in the request.
+  --
+  -- Whether this function considers `X-Forwarded-Prefix` or not depends on
+  -- several Kong configuration parameters:
+  --
+  -- * [trusted\_ips](https://docs.konghq.com/gateway/latest/reference/configuration/#trusted_ips)
+  -- * [real\_ip\_header](https://docs.konghq.com/gateway/latest/reference/configuration/#real_ip_header)
+  -- * [real\_ip\_recursive](https://docs.konghq.com/gateway/latest/reference/configuration/#real_ip_recursive)
+  --
+  -- **Note**: Kong does not do any normalization on the request path prefix.
+  --
+  -- @function kong.request.get_forwarded_prefix
+  -- @phases rewrite, access, header_filter, response, body_filter, log, admin_api
+  -- @treturn string|nil The forwarded path prefix or `nil` if the prefix was
+  -- not stripped.
+  -- @usage
+  -- kong.request.get_forwarded_prefix() -- /prefix
+  function _REQUEST.get_forwarded_prefix()
+    check_phase(PHASES.request)
+
+    local prefix
+    if self.ip.is_trusted(self.client.get_ip()) then
+      prefix = _REQUEST.get_header(X_FORWARDED_PREFIX)
       if prefix then
         return prefix
       end
     end
 
-    local path = _REQUEST.get_path()
-    return path == "" and "/" or path
+    return var.upstream_x_forwarded_prefix
   end
 
 
@@ -291,75 +337,105 @@ local function new(self)
   -- unrecognized values.
   --
   -- @function kong.request.get_http_version
-  -- @phases rewrite, access, header_filter, body_filter, log, admin_api
-  -- @treturn number|nil the HTTP version as a Lua number
+  -- @phases rewrite, access, header_filter, response, body_filter, log, admin_api
+  -- @treturn number|nil The HTTP version as a Lua number.
   -- @usage
   -- kong.request.get_http_version() -- 1.1
   function _REQUEST.get_http_version()
     check_phase(PHASES.request)
 
-    return ngx.req.http_version()
+    return req.http_version()
   end
 
 
   ---
   -- Returns the HTTP method of the request. The value is normalized to
-  -- upper-case.
+  -- uppercase.
   --
   -- @function kong.request.get_method
-  -- @phases rewrite, access, header_filter, body_filter, log, admin_api
-  -- @treturn string the request method
+  -- @phases rewrite, access, header_filter, response, body_filter, log, admin_api
+  -- @treturn string The request method.
   -- @usage
   -- kong.request.get_method() -- "GET"
   function _REQUEST.get_method()
     check_phase(PHASES.request)
 
     if ngx.ctx.KONG_UNEXPECTED and _REQUEST.get_http_version() < 2 then
-      local req_line = ngx.var.request
+      local req_line = var.request
       local idx = find(req_line, " ", 1, true)
       if idx then
         return sub(req_line, 1, idx - 1)
       end
     end
 
-    return ngx.req.get_method()
+    return req.get_method()
+  end
+
+
+  ---
+  -- Returns the normalized path component of the request's URL. The return
+  -- value is the same as `kong.request.get_raw_path()` but normalized according
+  -- to RFC 3986 section 6:
+  --
+  -- * Percent-encoded values of unreserved characters are decoded (`%20`
+  --   becomes ` `).
+  -- * Percent-encoded values of reserved characters have their hexidecimal
+  --   value uppercased (`%2f` becomes `%2F`).
+  -- * Relative path elements (`/.` and `/..`) are dereferenced.
+  -- * Duplicate slashes are consolidated (`//` becomes `/`).
+  --
+  -- @function kong.request.get_path
+  -- @phases rewrite, access, header_filter, response, body_filter, log, admin_api
+  -- @treturn string the path
+  -- @usage
+  -- -- Given a request to https://example.com/t/Abc%20123%C3%B8%2f/parent/..//test/./
+  --
+  -- kong.request.get_path() -- "/t/Abc 123ø%2F/test/"
+  function _REQUEST.get_path()
+    return normalize(_REQUEST.get_raw_path(), true)
   end
 
 
   ---
   -- Returns the path component of the request's URL. It is not normalized in
-  -- any way and does not include the querystring.
+  -- any way and does not include the query string.
   --
-  -- @function kong.request.get_path
-  -- @phases rewrite, access, header_filter, body_filter, log, admin_api
-  -- @treturn string the path
+  -- **NOTE:** Using the raw path to perform string comparision during request
+  -- handling (such as in routing, ACL/authorization checks, setting rate-limit
+  -- keys, etc) is widely regarded as insecure, as it can leave plugin code
+  -- vulnerable to path traversal attacks. Prefer `kong.request.get_path()` for
+  -- such use cases.
+  --
+  -- @function kong.request.get_raw_path
+  -- @phases rewrite, access, header_filter, response, body_filter, log, admin_api
+  -- @treturn string The path.
   -- @usage
-  -- -- Given a request to https://example.com:1234/v1/movies?movie=foo
+  -- -- Given a request to https://example.com/t/Abc%20123%C3%B8%2f/parent/..//test/./?movie=foo
   --
-  -- kong.request.get_path() -- "/v1/movies"
-  function _REQUEST.get_path()
+  -- kong.request.get_raw_path() -- "/t/Abc%20123%C3%B8%2f/parent/..//test/./"
+  function _REQUEST.get_raw_path()
     check_phase(PHASES.request)
 
-    local uri = ngx.var.request_uri or ""
+    local uri = var.request_uri or ""
     local s = find(uri, "?", 2, true)
     return s and sub(uri, 1, s - 1) or uri
   end
 
 
   ---
-  -- Returns the path, including the querystring if any. No
-  -- transformations/normalizations are done.
+  -- Returns the path, including the query string if any. No
+  -- transformations or normalizations are done.
   --
   -- @function kong.request.get_path_with_query
-  -- @phases rewrite, access, header_filter, body_filter, log, admin_api
-  -- @treturn string the path with the querystring
+  -- @phases rewrite, access, header_filter, response, body_filter, log, admin_api
+  -- @treturn string The path with the query string.
   -- @usage
   -- -- Given a request to https://example.com:1234/v1/movies?movie=foo
   --
   -- kong.request.get_path_with_query() -- "/v1/movies?movie=foo"
   function _REQUEST.get_path_with_query()
     check_phase(PHASES.request)
-    return ngx.var.request_uri or ""
+    return var.request_uri or ""
   end
 
 
@@ -369,8 +445,8 @@ local function new(self)
   -- include the leading `?` character.
   --
   -- @function kong.request.get_raw_query
-  -- @phases rewrite, access, header_filter, body_filter, log, admin_api
-  -- @return string the query component of the request's URL
+  -- @phases rewrite, access, header_filter, response, body_filter, log, admin_api
+  -- @treturn string The query component of the request's URL.
   -- @usage
   -- -- Given a request to https://example.com/foo?msg=hello%20world&bla=&bar
   --
@@ -378,7 +454,7 @@ local function new(self)
   function _REQUEST.get_raw_query()
     check_phase(PHASES.request)
 
-    return ngx.var.args or ""
+    return var.args or ""
   end
 
 
@@ -391,11 +467,11 @@ local function new(self)
   -- found.
   --
   -- If an argument with the same name is present multiple times in the
-  -- querystring, this function will return the value of the first occurrence.
+  -- query string, this function returns the value of the first occurrence.
   --
   -- @function kong.request.get_query_arg
-  -- @phases rewrite, access, header_filter, body_filter, log, admin_api
-  -- @treturn string|boolean|nil the value of the argument
+  -- @phases rewrite, access, header_filter, response, body_filter, log, admin_api
+  -- @treturn string|boolean|nil The value of the argument.
   -- @usage
   -- -- Given a request GET /test?foo=hello%20world&bar=baz&zzz&blo=&bar=bla&bar
   --
@@ -420,7 +496,7 @@ local function new(self)
 
 
   ---
-  -- Returns the table of query arguments obtained from the querystring. Keys
+  -- Returns the table of query arguments obtained from the query string. Keys
   -- are query argument names. Values are either a string with the argument
   -- value, a boolean `true` if an argument was not given a value, or an array
   -- if an argument was given in the query string multiple times. Keys and
@@ -435,10 +511,10 @@ local function new(self)
   -- greater than **1** and not greater than **1000**.
   --
   -- @function kong.request.get_query
-  -- @phases rewrite, access, header_filter, body_filter, log, admin_api
-  -- @tparam[opt] number max_args set a limit on the maximum number of parsed
-  -- arguments
-  -- @treturn table A table representation of the query string
+  -- @phases rewrite, access, header_filter, response, body_filter, log, admin_api
+  -- @tparam[opt] number max_args Sets a limit on the maximum number of parsed
+  -- arguments.
+  -- @treturn table A table representation of the query string.
   -- @usage
   -- -- Given a request GET /test?foo=hello%20world&bar=baz&zzz&blo=&bar=bla&bar
   --
@@ -472,7 +548,7 @@ local function new(self)
     end
 
     if ngx.ctx.KONG_UNEXPECTED and _REQUEST.get_http_version() < 2 then
-      local req_line = ngx.var.request
+      local req_line = var.request
       local qidx = find(req_line, "?", 1, true)
       if not qidx then
         return {}
@@ -487,7 +563,7 @@ local function new(self)
       return ngx.decode_args(sub(req_line, qidx + 1, eidx - 1), max_args)
     end
 
-    return ngx.req.get_uri_args(max_args)
+    return req.get_uri_args(max_args)
   end
 
 
@@ -496,7 +572,7 @@ local function new(self)
   --
   -- The returned value is either a `string`, or can be `nil` if a header with
   -- `name` was not found in the request. If a header with the same name is
-  -- present multiple times in the request, this function will return the value
+  -- present multiple times in the request, this function returns the value
   -- of the first occurrence of this header.
   --
   -- Header names in are case-insensitive and are normalized to lowercase, and
@@ -504,7 +580,7 @@ local function new(self)
   -- `X-Custom-Header` can also be retrieved as `x_custom_header`.
   --
   -- @function kong.request.get_header
-  -- @phases rewrite, access, header_filter, body_filter, log, admin_api
+  -- @phases rewrite, access, header_filter, response, body_filter, log, admin_api
   -- @tparam string name the name of the header to be returned
   -- @treturn string|nil the value of the header or nil if not present
   -- @usage
@@ -525,10 +601,8 @@ local function new(self)
       error("header name must be a string", 2)
     end
 
-    local header_value = _REQUEST.get_headers()[name]
-    if type(header_value) == "table" then
-      return header_value[1]
-    end
+    -- Do not localize ngx.re.gsub! It will crash because ngx.re is monkey patched.
+    local header_value = var["http_" .. ngx.re.gsub(name, "-", "_", "jo")]
 
     return header_value
   end
@@ -547,10 +621,10 @@ local function new(self)
   -- be greater than **1** and not greater than **1000**.
   --
   -- @function kong.request.get_headers
-  -- @phases rewrite, access, header_filter, body_filter, log, admin_api
-  -- @tparam[opt] number max_headers set a limit on the maximum number of
-  -- parsed headers
-  -- @treturn table the request headers in table form
+  -- @phases rewrite, access, header_filter, response, body_filter, log, admin_api
+  -- @tparam[opt] number max_headers Sets a limit on the maximum number of
+  -- parsed headers.
+  -- @treturn table The request headers in table form.
   -- @usage
   -- -- Given a request with the following headers:
   --
@@ -568,7 +642,7 @@ local function new(self)
     check_phase(PHASES.request)
 
     if max_headers == nil then
-      return ngx.req.get_headers(MAX_HEADERS_DEFAULT)
+      return req.get_headers(MAX_HEADERS_DEFAULT)
     end
 
     if type(max_headers) ~= "number" then
@@ -581,12 +655,13 @@ local function new(self)
       error("max_headers must be <= " .. MAX_HEADERS, 2)
     end
 
-    return ngx.req.get_headers(max_headers)
+    return req.get_headers(max_headers)
   end
 
 
   local before_content = phase_checker.new(PHASES.rewrite,
                                            PHASES.access,
+                                           PHASES.response,
                                            PHASES.error,
                                            PHASES.admin_api)
 
@@ -597,12 +672,12 @@ local function new(self)
   -- If the body has no size (empty), this function returns an empty string.
   --
   -- If the size of the body is greater than the Nginx buffer size (set by
-  -- `client_body_buffer_size`), this function will fail and return an error
+  -- `client_body_buffer_size`), this function fails and returns an error
   -- message explaining this limitation.
   --
   -- @function kong.request.get_raw_body
-  -- @phases rewrite, access, admin_api
-  -- @treturn string the plain request body
+  -- @phases rewrite, access, response, admin_api
+  -- @treturn string The plain request body.
   -- @usage
   -- -- Given a body with payload "Hello, Earth!":
   --
@@ -610,11 +685,11 @@ local function new(self)
   function _REQUEST.get_raw_body()
     check_phase(before_content)
 
-    ngx.req.read_body()
+    req.read_body()
 
-    local body = ngx.req.get_body_data()
+    local body = req.get_body_data()
     if not body then
-      if ngx.req.get_body_file() then
+      if req.get_body_file() then
         return nil, "request body did not fit into client body buffer, consider raising 'client_body_buffer_size'"
 
       else
@@ -629,10 +704,21 @@ local function new(self)
   ---
   -- Returns the request data as a key/value table.
   -- A high-level convenience function.
+  --
   -- The body is parsed with the most appropriate format:
   --
-  -- * If `mimetype` is specified:
-  --   * Decodes the body with the requested content type (if supported).
+  -- * If `mimetype` is specified, it decodes the body with the requested
+  --   content type (if supported). This takes precedence over any content type
+  --   present in the request.
+  --
+  --   The optional argument `mimetype` can be one of the following strings:
+  --     * `application/x-www-form-urlencoded`
+  --     * `application/json`
+  --     * `multipart/form-data`
+  --
+  -- Whether `mimetype` is specified or a request content type is otherwise
+  -- present in the request, each content type behaves as follows:
+  --
   -- * If the request content type is `application/x-www-form-urlencoded`:
   --   * Returns the body as form-encoded.
   -- * If the request content type is `multipart/form-data`:
@@ -643,14 +729,9 @@ local function new(self)
   --   * Decodes the body as JSON
   --     (same as `json.decode(kong.request.get_raw_body())`).
   --   * JSON types are converted to matching Lua types.
-  -- * If none of the above, returns `nil` and an error message indicating the
+  -- * If the request contains none of the above and the `mimetype` argument is
+  --   not set, returns `nil` and an error message indicating the
   --   body could not be parsed.
-  --
-  -- The optional argument `mimetype` can be one of the following strings:
-  --
-  -- * `application/x-www-form-urlencoded`
-  -- * `application/json`
-  -- * `multipart/form-data`
   --
   -- The optional argument `max_args` can be used to set a limit on the number
   -- of form arguments parsed for `application/x-www-form-urlencoded` payloads.
@@ -660,13 +741,13 @@ local function new(self)
   -- what MIME type the body was parsed as.
   --
   -- @function kong.request.get_body
-  -- @phases rewrite, access, admin_api
-  -- @tparam[opt] string mimetype the MIME type
-  -- @tparam[opt] number max_args set a limit on the maximum number of parsed
-  -- arguments
-  -- @treturn table|nil a table representation of the body
-  -- @treturn string|nil an error message
-  -- @treturn string|nil mimetype the MIME type used
+  -- @phases rewrite, access, response, admin_api
+  -- @tparam[opt] string mimetype The MIME type.
+  -- @tparam[opt] number max_args Sets a limit on the maximum number of parsed
+  -- arguments.
+  -- @treturn table|nil A table representation of the body.
+  -- @treturn string|nil An error message.
+  -- @treturn string|nil mimetype The MIME type used.
   -- @usage
   -- local body, err, mimetype = kong.request.get_body()
   -- body.name -- "John Doe"
@@ -702,8 +783,8 @@ local function new(self)
 
       -- TODO: should we also compare content_length to client_body_buffer_size here?
 
-      ngx.req.read_body()
-      local pargs, err = ngx.req.get_post_args(max_args or MAX_POST_ARGS_DEFAULT)
+      req.read_body()
+      local pargs, err = req.get_post_args(max_args or MAX_POST_ARGS_DEFAULT)
       if not pargs then
         return nil, err, CONTENT_TYPE_POST
       end
@@ -729,12 +810,35 @@ local function new(self)
         return nil, err, CONTENT_TYPE_FORM_DATA
       end
 
-      -- TODO: multipart library doesn't support multiple fields with same name
-      return multipart(body, content_type):get_all(), nil, CONTENT_TYPE_FORM_DATA
+      local parts = multipart(body, content_type)
+      if not parts then
+        return nil, "unable to decode multipart body", CONTENT_TYPE_FORM_DATA
+      end
+
+      local margs = parts:get_all_with_arrays()
+      if not margs then
+        return nil, "unable to read multipart values", CONTENT_TYPE_FORM_DATA
+      end
+
+      return margs, nil, CONTENT_TYPE_FORM_DATA
 
     else
       return nil, "unsupported content type '" .. content_type .. "'", content_type_lower
     end
+  end
+
+  ---
+  -- Returns the request start time, in Unix epoch milliseconds.
+  --
+  -- @function kong.request.get_start_time
+  -- @phases rewrite, access, header_filter, response, body_filter, log, admin_api
+  -- @treturn number The timestamp
+  -- @usage
+  -- kong.request.get_start_time() -- 1649960273000
+  function _REQUEST.get_start_time()
+    check_phase(PHASES.request)
+
+    return ngx.ctx.KONG_PROCESSING_START or (req.start_time() * 1000)
   end
 
 

@@ -5,6 +5,7 @@ local arrays       = require "pgmoon.arrays"
 local stringx      = require "pl.stringx"
 local semaphore    = require "ngx.semaphore"
 local kong_global = require "kong.global"
+local constants = require "kong.constants"
 
 
 local setmetatable = setmetatable
@@ -27,7 +28,8 @@ local log          = ngx.log
 local match        = string.match
 local fmt          = string.format
 local sub          = string.sub
-local kong         = kong
+local utils_toposort = utils.topological_sort
+local insert       = table.insert
 
 
 local WARN                          = ngx.WARN
@@ -41,82 +43,19 @@ local PROTECTED_TABLES = {
   schema_migrations = true,
   schema_meta       = true,
   locks             = true,
+  parameters        = true,
 }
 local OPERATIONS = {
   read  = true,
   write = true,
 }
 local ADMIN_API_PHASE = kong_global.phases.admin_api
-local kong_get_phase = kong_global.get_phase
+local CORE_ENTITIES = constants.CORE_ENTITIES
 
 
 local function now_updated()
   update_time()
   return now()
-end
-
-
-local function visit(k, n, m, s)
-  if m[k] == 0 then return 1 end
-  if m[k] == 1 then return end
-  m[k] = 0
-  local f = n[k]
-  for i=1, #f do
-    if visit(f[i], n, m, s) then return 1 end
-  end
-  m[k] = 1
-  s[#s+1] = k
-end
-
-
-local tsort = {}
-tsort.__index = tsort
-
-
-function tsort.new()
-  return setmetatable({ n = {} }, tsort)
-end
-
-
-function tsort:add(...)
-  local p = { ... }
-  local c = #p
-  if c == 0 then return self end
-  if c == 1 then
-    p = p[1]
-    if type(p) == "table" then
-      c = #p
-    else
-      p = { p }
-    end
-  end
-  local n = self.n
-  for i=1, c do
-    local f = p[i]
-    if n[f] == nil then n[f] = {} end
-  end
-  for i=2, c, 1 do
-    local f = p[i]
-    local t = p[i-1]
-    local o = n[f]
-    o[#o+1] = t
-  end
-  return self
-end
-
-
-function tsort:sort()
-  local n  = self.n
-  local s = {}
-  local m  = {}
-  for k in pairs(n) do
-    if m[k] == nil then
-      if visit(k, n, m, s) then
-        return nil, "There is a circular dependency in the graph. It is not possible to derive a topological sort."
-      end
-    end
-  end
-  return s
 end
 
 
@@ -144,6 +83,72 @@ local function get_table_names(self, excluded)
   end
 
   return table_names
+end
+
+
+local get_names_of_tables_with_ttl
+do
+  local CORE_SCORE = {}
+  for _, v in ipairs(CORE_ENTITIES) do
+    CORE_SCORE[v] = 1
+  end
+  CORE_SCORE["workspaces"] = 2
+
+
+  local function sort_core_tables_first(a, b)
+    local sa = CORE_SCORE[a] or 0
+    local sb = CORE_SCORE[b] or 0
+    if sa == sb then
+      -- sort tables in reverse order so that they end up sorted alphabetically,
+      -- because utils_topological sort does "dependencies first" and then current.
+      return a > b
+    end
+    return sa < sb
+  end
+
+  local sort = table.sort
+  get_names_of_tables_with_ttl = function(strategies)
+    local s
+    local ttl_schemas_by_name = {}
+    local table_names = {}
+    for _, strategy in pairs(strategies) do
+      s = strategy.schema
+      if s.ttl then
+        table_names[#table_names + 1] = s.name
+        ttl_schemas_by_name[s.name] = s
+      end
+    end
+
+    sort(table_names, sort_core_tables_first)
+
+    local get_table_name_neighbors = function(table_name)
+      local neighbors = {}
+      local neighbors_len = 0
+      local neighbor
+      local schema = ttl_schemas_by_name[table_name]
+
+      for _, field in schema:each_field() do
+        if field.type == "foreign" and field.schema.ttl then
+          neighbor = field.reference
+          if ttl_schemas_by_name[neighbor] then -- the neighbor schema name is on table_names
+            neighbors_len = neighbors_len + 1
+            neighbors[neighbors_len] = neighbor
+          end
+          -- else the neighbor points to an unknown/uninteresting schema. This happens in tests.
+        end
+      end
+
+      return neighbors
+    end
+
+    local res, err = utils_toposort(table_names, get_table_name_neighbors)
+
+    if res then
+      insert(res, 1, "cluster_events")
+    end
+
+    return res, err
+  end
 end
 
 
@@ -187,8 +192,8 @@ end
 local setkeepalive
 
 
-local function connect(config)
-  local phase  = get_phase(kong)
+local function reconnect(config)
+  local phase = get_phase()
   if phase == "init" or phase == "init_worker" or ngx.IS_CLI then
     -- Force LuaSocket usage in the CLI in order to allow for self-signed
     -- certificates to be trusted (via opts.cafile) in the resty-cli
@@ -234,6 +239,11 @@ local function connect(config)
   end
 
   return connection
+end
+
+
+local function connect(config)
+  return kong.vault.try(reconnect, config)
 end
 
 
@@ -298,30 +308,14 @@ end
 
 function _mt:init_worker(strategies)
   if ngx.worker.id() == 0 then
-    local graph = tsort.new()
 
-    graph:add("cluster_events")
-
-    for _, strategy in pairs(strategies) do
-      local schema = strategy.schema
-      if schema.ttl then
-        local name = schema.name
-        graph:add(name)
-        for _, field in schema:each_field() do
-          if field.type == "foreign" and field.schema.ttl then
-            graph:add(name, field.schema.name)
-          end
-        end
-      end
-    end
-
-    local sorted_strategies = graph:sort()
+    local table_names = get_names_of_tables_with_ttl(strategies)
     local ttl_escaped = self:escape_identifier("ttl")
     local expire_at_escaped = self:escape_identifier("expire_at")
     local cleanup_statements = {}
-    local cleanup_statements_count = #sorted_strategies
+    local cleanup_statements_count = #table_names
     for i = 1, cleanup_statements_count do
-      local table_name = sorted_strategies[i]
+      local table_name = table_names[i]
       local column_name = table_name == "cluster_events" and expire_at_escaped
                                                           or ttl_escaped
       cleanup_statements[i] = concat {
@@ -349,11 +343,11 @@ function _mt:init_worker(strategies)
             if not ok then
               if err then
                 log(WARN, "unable to clean expired rows from table '",
-                          sorted_strategies[i], "' on PostgreSQL database (",
+                          table_names[i], "' on PostgreSQL database (",
                           err, ")")
               else
                 log(WARN, "unable to clean expired rows from table '",
-                          sorted_strategies[i], "' on PostgreSQL database")
+                          table_names[i], "' on PostgreSQL database")
               end
             end
           end
@@ -497,11 +491,11 @@ function _mt:query(sql, operation)
     error("operation must be 'read' or 'write', was: " .. tostring(operation), 2)
   end
 
-  local phase  = get_phase(kong)
+  local phase = get_phase()
 
   if not operation or
      not self.config_ro or
-     (phase == "content" and kong_get_phase(kong) == ADMIN_API_PHASE)
+     (phase == "content" and ngx.ctx.KONG_PHASE == ADMIN_API_PHASE)
   then
     -- admin API requests skips the replica optimization
     -- to ensure all its results are always strongly consistent
@@ -726,7 +720,7 @@ function _mt:schema_migrations()
     "SELECT *\n",
     "  FROM schema_meta\n",
     " WHERE key = ",  self:escape_literal("schema_meta"), ";"
-  }))
+  }), "read")
 
   if not rows then
     return nil, err
@@ -925,10 +919,22 @@ function _M.new(kong_config)
     schema      = kong_config.pg_schema or "",
     ssl         = kong_config.pg_ssl,
     ssl_verify  = kong_config.pg_ssl_verify,
-    cafile      = kong_config.lua_ssl_trusted_certificate,
+    cafile      = kong_config.lua_ssl_trusted_certificate_combined,
     sem_max     = kong_config.pg_max_concurrent_queries or 0,
     sem_timeout = (kong_config.pg_semaphore_timeout or 60000) / 1000,
   }
+
+  local refs = kong_config["$refs"]
+  if refs then
+    local user_ref = refs.pg_user
+    local password_ref = refs.pg_password
+    if user_ref or password_ref then
+      config["$refs"] = {
+        user = user_ref,
+        password = password_ref,
+      }
+    end
+  end
 
   local db = pgmoon.new(config)
 
@@ -962,11 +968,22 @@ function _M.new(kong_config)
       schema      = kong_config.pg_ro_schema,
       ssl         = kong_config.pg_ro_ssl,
       ssl_verify  = kong_config.pg_ro_ssl_verify,
-      cafile      = kong_config.lua_ssl_trusted_certificate,
+      cafile      = kong_config.lua_ssl_trusted_certificate_combined,
       sem_max     = kong_config.pg_ro_max_concurrent_queries,
       sem_timeout = kong_config.pg_ro_semaphore_timeout and
                     (kong_config.pg_ro_semaphore_timeout / 1000) or nil,
     }
+
+    if refs then
+      local ro_user_ref = refs.pg_ro_user
+      local ro_password_ref = refs.pg_ro_password
+      if ro_user_ref or ro_password_ref then
+        ro_override["$refs"] = {
+          user = ro_user_ref,
+          password = ro_password_ref,
+        }
+      end
+    end
 
     local config_ro = utils.table_merge(config, ro_override)
 
@@ -986,6 +1003,9 @@ function _M.new(kong_config)
 
   return setmetatable(self, _mt)
 end
+
+-- for tests only
+_mt._get_topologically_sorted_table_names = get_names_of_tables_with_ttl
 
 
 return _M

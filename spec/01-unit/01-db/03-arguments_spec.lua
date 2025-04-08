@@ -1,11 +1,14 @@
 local arguments    = require "kong.api.arguments"
 local Schema       = require "kong.db.schema"
+local helpers      = require "spec.helpers"
+
 
 local infer_value = arguments.infer_value
 local infer       = arguments.infer
 local decode_arg  = arguments.decode_arg
 local decode      = arguments.decode
 local combine     = arguments.combine
+local deep_sort   = helpers.deep_sort
 
 
 describe("arguments.infer_value", function()
@@ -102,6 +105,33 @@ describe("arguments.infer", function()
       comments = ngx.null
     }, infer(args, schema))
   end)
+
+  it("infers shorthand_fields but does not run the func", function()
+    local schema = Schema.new({
+      fields = {
+        { name = { type = "string" } },
+        { another_array = { type = "array", elements = { type = { "string" } } } },
+      },
+      shorthand_fields = {
+        { an_array = {
+            type = "array",
+            elements = { type = { "string" } },
+            func = function(value)
+              return { another_array = value:upper() }
+            end,
+          }
+        },
+      }
+    })
+
+    local args = { name = "peter",
+                   an_array = "something" }
+    assert.same({
+      name = "peter",
+      an_array = { "something" },
+    }, infer(args, schema))
+  end)
+
 end)
 
 describe("arguments.combine", function()
@@ -153,7 +183,7 @@ end)
 describe("arguments.decode", function()
 
   it("decodes complex nested parameters", function()
-    assert.same({
+    assert.same(deep_sort{
       c = "test",
       a = {
         {
@@ -178,7 +208,7 @@ describe("arguments.decode", function()
         }
       },
     },
-    decode{
+    deep_sort(decode{
       ["a.b.c.d"] = "",
       ["a"]       = { "1", "2", "3" },
       ["c"]       = "test",
@@ -186,7 +216,7 @@ describe("arguments.decode", function()
       ["a[]"]     = { "a", "b", "c" },
       ["a[99]"]   = "wayne",
       ["a[1]"]    = "first",
-    })
+    }))
   end)
 
   it("decodes complex nested parameters combinations", function()
@@ -260,7 +290,11 @@ describe("arguments.decode", function()
     })
   end)
 
-  it("decodes different array representations", function()
+  pending("decodes different array representations", function()
+    -- undefined:  the result depends on wether `["a"]` or `["a[2]"]` is applied first
+    -- but there's no way to guarantee order without adding a "presort keys" step.
+    -- but it's unlikely that a real-world client uses both forms in the same request,
+    -- instead of making `decode()` slower, split test in two
     local decoded = decode{
       ["a"]    = { "1", "2" },
       ["a[]"]  = "3",
@@ -269,13 +303,40 @@ describe("arguments.decode", function()
     }
 
     assert.same(
-      { a = {
+      deep_sort{ a = {
           { "4", "1", "3" },
           { "5", "6", "2" },
         }
       },
-      decoded
+      deep_sort(decoded)
     )
+  end)
+
+  it("decodes different array representations", function()
+    -- same as previous test, but split to reduce ordering dependency
+    assert.same(
+      { a = {
+        "2",
+        { "1", "3", "4" },
+        }
+      },
+      deep_sort(decode{
+        ["a"]    = { "1", "2" },
+        ["a[]"]  = "3",
+        ["a[1]"] = "4",
+      }))
+
+    assert.same(
+      { a = {
+          { "3", "4" },
+          { "5", "6" },
+        }
+      },
+      deep_sort(decode{
+        ["a[]"]  = "3",
+        ["a[1]"] = "4",
+        ["a[2]"] = { "5", "6" },
+      }))
   end)
 
   it("infers values when provided with a schema", function()

@@ -1,17 +1,13 @@
 ---
--- The Plugin Development Kit (or "PDK") is set of Lua functions and variables
--- that can be used by plugins to implement their own logic. The PDK is a
--- [Semantically Versioned](https://semver.org/) component, originally
--- released in Kong 0.14.0. The PDK will be guaranteed to be forward-compatible
--- from its 1.0.0 release and on.
---
--- As of this release, the PDK has not yet reached 1.0.0, but plugin authors
--- can already depend on it for a safe and reliable way of interacting with the
--- request, response, or the core components.
+-- The Plugin Development Kit (PDK) is set of Lua functions and variables
+-- that can be used by plugins to implement their own logic.
+-- The PDK is originally released in Kong 0.14.0.
+-- The PDK is guaranteed to be forward-compatible
+-- from its 1.0.0 release and onward.
 --
 -- The Plugin Development Kit is accessible from the `kong` global variable,
 -- and various functionalities are namespaced under this table, such as
--- `kong.request`, `kong.log`, etc...
+-- `kong.request`, `kong.log`, etc.
 --
 -- @module PDK
 -- @release 1.0.0
@@ -42,32 +38,13 @@
 
 
 ---
--- A number representing the major version of the current PDK (e.g.
--- `1`). Useful for feature-existence checks or backwards-compatible behavior
--- as users of the PDK.
---
--- @field kong.pdk_major_version
--- @usage
--- if kong.pdk_version_num < 2 then
---   -- PDK is below version 2
--- end
-
-
----
--- A human-readable string containing the version number of the current PDK.
---
--- @field kong.pdk_version
--- @usage print(kong.pdk_version) -- "1.0.0"
-
-
----
 -- A read-only table containing the configuration of the current Kong node,
 -- based on the configuration file and environment variables.
 --
 -- See [kong.conf.default](https://github.com/Kong/kong/blob/master/kong.conf.default)
 -- for details.
 --
--- Comma-separated lists in that file get promoted to arrays of strings in this
+-- Comma-separated lists in the `kong.conf` file get promoted to arrays of strings in this
 -- table.
 --
 -- @field kong.configuration
@@ -147,7 +124,7 @@
 -- Instance of Kong's DNS resolver, a client object from the
 -- [lua-resty-dns-client](https://github.com/kong/lua-resty-dns-client) module.
 --
--- **Note:** usage of this module is currently reserved to the core or to
+-- **Note:** Usage of this module is currently reserved to the core or to
 -- advanced users.
 --
 -- @field kong.dns
@@ -158,7 +135,7 @@
 -- [lua-resty-worker-events](https://github.com/Kong/lua-resty-worker-events)
 -- module.
 --
--- **Note:** usage of this module is currently reserved to the core or to
+-- **Note:** Usage of this module is currently reserved to the core or to
 -- advanced users.
 --
 -- @field kong.worker_events
@@ -167,7 +144,7 @@
 ---
 -- Instance of Kong's cluster events module for inter-nodes communication.
 --
--- **Note:** usage of this module is currently reserved to the core or to
+-- **Note:** Usage of this module is currently reserved to the core or to
 -- advanced users.
 --
 -- @field kong.cluster_events
@@ -176,7 +153,7 @@
 ---
 -- Instance of Kong's database caching object, from the `kong.cache` module.
 --
--- **Note:** usage of this module is currently reserved to the core or to
+-- **Note:** Usage of this module is currently reserved to the core or to
 -- advanced users.
 --
 -- @field kong.cache
@@ -208,11 +185,16 @@
 
 assert(package.loaded["resty.core"])
 
+local base = require "resty.core.base"
 
-local MAJOR_VERSIONS = {
-  [1] = {
-    version = "1.4.0",
-    modules = {
+local type = type
+local error = error
+local rawget = rawget
+local ipairs = ipairs
+local setmetatable = setmetatable
+
+
+local MAJOR_MODULES = {
       "table",
       "node",
       "log",
@@ -226,22 +208,19 @@ local MAJOR_VERSIONS = {
       "response",
       "router",
       "nginx",
-    },
-  },
-
-  latest = 1,
+      "cluster",
+      "vault",
+      "tracing",
 }
 
 if ngx.config.subsystem == 'http' then
-  table.insert(MAJOR_VERSIONS[1].modules, 'client.tls')
+  table.insert(MAJOR_MODULES, 'client.tls')
 end
 
-local _PDK = {
-  major_versions = MAJOR_VERSIONS,
-}
+local _PDK = { }
 
 
-function _PDK.new(kong_config, major_version, self)
+function _PDK.new(kong_config, self)
   if kong_config then
     if type(kong_config) ~= "table" then
       error("kong_config must be a table", 2)
@@ -251,23 +230,14 @@ function _PDK.new(kong_config, major_version, self)
     kong_config = {}
   end
 
-  if major_version then
-    if type(major_version) ~= "number" then
-      error("major_version must be a number", 2)
-    end
-
-  else
-    major_version = MAJOR_VERSIONS.latest
-  end
-
-  local version_meta = MAJOR_VERSIONS[major_version]
-
   self = self or {}
 
-  self.pdk_major_version = major_version
-  self.pdk_version = version_meta.version
-
-  self.configuration = setmetatable({}, {
+  self.configuration = setmetatable({
+    remove_sensitive = function()
+      local conf_loader = require "kong.conf_loader"
+      return conf_loader.remove_sensitive(kong_config)
+    end,
+  }, {
     __index = function(_, v)
       return kong_config[v]
     end,
@@ -277,7 +247,7 @@ function _PDK.new(kong_config, major_version, self)
     end,
   })
 
-  for _, module_name in ipairs(version_meta.modules) do
+  for _, module_name in ipairs(MAJOR_MODULES) do
     local parent = self
     for part in module_name:gmatch("([^.]+)%.") do
       if not parent[part] then
@@ -302,13 +272,12 @@ function _PDK.new(kong_config, major_version, self)
 
   return setmetatable(self, {
     __index = function(t, k)
-      if k == "core_log" then
-        return (rawget(t, "_log"))
-      end
-
       if k == "log" then
-        if t.ctx.core and t.ctx.core.log then
-          return t.ctx.core.log
+        if base.get_request() then
+          local log = ngx.ctx.KONG_LOG
+          if log then
+            return log
+          end
         end
 
         return (rawget(t, "_log"))

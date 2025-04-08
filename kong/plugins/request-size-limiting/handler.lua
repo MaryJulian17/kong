@@ -1,13 +1,14 @@
 -- Copyright (C) Kong Inc.
 
 local strip = require("pl.stringx").strip
+local kong_meta = require "kong.meta"
 local tonumber = tonumber
 
 
 local RequestSizeLimitingHandler = {}
 
 RequestSizeLimitingHandler.PRIORITY = 951
-RequestSizeLimitingHandler.VERSION = "2.0.0"
+RequestSizeLimitingHandler.VERSION = kong_meta.version
 
 
 local size_units = {
@@ -44,6 +45,9 @@ function RequestSizeLimitingHandler:access(conf)
   if cl and tonumber(cl) then
     check_size(tonumber(cl), conf.allowed_payload_size, headers, conf.size_unit)
   else
+    if conf.require_content_length and headers["Transfer-Encoding"] ~= "chunked" then
+      return kong.response.error(411, "A valid Content-Length header is required")
+    end
     -- If the request body is too big, this could consume too much memory (to check)
     local data = kong.request.get_raw_body()
     if data then

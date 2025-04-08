@@ -9,13 +9,13 @@ local severity = {
 return {
   name = "loggly",
   fields = {
-    { protocols = typedefs.protocols_http },
+    { protocols = typedefs.protocols },
     { config = {
         type = "record",
         fields = {
           { host = typedefs.host({ default = "logs-01.loggly.com" }), },
           { port = typedefs.port({ default = 514 }), },
-          { key = { type = "string", required = true }, },
+          { key = { type = "string", required = true, encrypted = true, referenceable = true }, }, -- encrypted = true is a Kong Enterprise Exclusive feature, it does nothing in Kong CE
           { tags = {
               type = "set",
               default = { "kong" },
@@ -26,6 +26,7 @@ return {
           { client_errors_severity = severity },
           { server_errors_severity = severity },
           { timeout = { type = "number", default = 10000 }, },
+          { custom_fields_by_lua = typedefs.lua_code },
         },
       },
     },

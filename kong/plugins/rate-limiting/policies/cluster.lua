@@ -5,8 +5,11 @@ local cassandra = require "cassandra"
 local kong = kong
 local concat = table.concat
 local pairs = pairs
+local ipairs = ipairs
 local floor = math.floor
 local fmt = string.format
+local tonumber = tonumber
+local tostring = tostring
 
 
 local EXPIRATION = require "kong.plugins.rate-limiting.expiration"
@@ -69,15 +72,23 @@ return {
       local buf = { "BEGIN" }
       local len = 1
       local periods = timestamp.get_timestamps(current_timestamp)
-      for period, period_date in pairs(periods) do
+      for _, period in ipairs(timestamp.timestamp_table_fields) do
+        local period_date = periods[period]
         if limits[period] then
           len = len + 1
           buf[len] = fmt([[
             INSERT INTO "ratelimiting_metrics" ("identifier", "period", "period_date", "service_id", "route_id", "value", "ttl")
-                 VALUES ('%s', '%s', TO_TIMESTAMP('%s') AT TIME ZONE 'UTC', '%s', '%s', %d, CURRENT_TIMESTAMP AT TIME ZONE 'UTC' + INTERVAL '%d second')
+                 VALUES (%s, %s, TO_TIMESTAMP(%s) AT TIME ZONE 'UTC', %s, %s, %s, CURRENT_TIMESTAMP AT TIME ZONE 'UTC' + INTERVAL %s)
             ON CONFLICT ("identifier", "period", "period_date", "service_id", "route_id") DO UPDATE
                     SET "value" = "ratelimiting_metrics"."value" + EXCLUDED."value"
-          ]], identifier, period, floor(period_date / 1000), service_id, route_id, value, EXPIRATION[period])
+          ]],
+            connector:escape_literal(identifier),
+            connector:escape_literal(period),
+            connector:escape_literal(tonumber(fmt("%.3f", floor(period_date / 1000)))),
+            connector:escape_literal(service_id),
+            connector:escape_literal(route_id),
+            connector:escape_literal(value),
+            connector:escape_literal(tostring(EXPIRATION[period]) .. " second"))
         end
       end
 

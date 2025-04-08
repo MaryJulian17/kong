@@ -247,6 +247,21 @@ for _, strategy in helpers.each_strategy() do
             assert.same(service, json)
           end)
 
+          it("retrieves by utf-8 name and percent-escaped utf-8 name", function()
+            local service = bp.services:insert({ name = "円" }, { nulls = true })
+            local res  = client:get("/services/" .. service.name)
+            local body = assert.res_status(200, res)
+
+            local json = cjson.decode(body)
+            assert.same(service, json)
+
+            res  = client:get("/services/%E5%86%86")
+            body = assert.res_status(200, res)
+
+            json = cjson.decode(body)
+            assert.same(service, json)
+          end)
+
           it("returns 404 if not found", function()
             local res = client:get("/services/" .. utils.uuid())
             assert.res_status(404, res)
@@ -807,7 +822,7 @@ for _, strategy in helpers.each_strategy() do
               })
             body = assert.res_status(400, res)
             json = cjson.decode(body)
-            assert.same({ protocol = "expected one of: grpc, grpcs, http, https, tcp, tls" }, json.fields)
+            assert.same({ protocol = "expected one of: grpc, grpcs, http, https, tcp, tls, tls_passthrough, udp" }, json.fields)
           end
         end)
 

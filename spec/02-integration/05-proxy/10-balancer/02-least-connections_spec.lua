@@ -1,50 +1,19 @@
 local cjson   = require "cjson"
 local helpers = require "spec.helpers"
 
+local https_server = helpers.https_server
+
+
+local test_port1 = helpers.get_available_port()
+local test_port2 = helpers.get_available_port()
+
+
 -- create two servers, one double the delay of the other
-local fixtures = {
-  http_mock = {
-    least_connections = [[
-
-      server {
-          server_name mock_delay_100;
-          listen 10001;
-
-          location ~ "/leastconnections" {
-              content_by_lua_block {
-                local delay = 100
-                ngx.sleep(delay/1000)
-                ngx.status = 200
-                ngx.say(delay)
-                ngx.exit(0)
-              }
-          }
-      }
-
-      server {
-          server_name mock_delay_200;
-          listen 10002;
-
-          location ~ "/leastconnections" {
-              content_by_lua_block {
-                local delay = 200
-                ngx.sleep(delay/1000)
-                ngx.status = 200
-                ngx.say(delay)
-                ngx.exit(0)
-              }
-          }
-      }
-
-  ]]
-  },
-}
-
+local server1 = https_server.new(test_port1, "127.0.0.1", "http", false, nil, 100)
+local server2 = https_server.new(test_port2, "127.0.0.1", "http", false, nil, 200)
 
 for _, strategy in helpers.each_strategy() do
   describe("Balancer: least-connections [#" .. strategy .. "]", function()
-    local proxy_client
-    local admin_client
     local upstream1_id
 
     lazy_setup(function()
@@ -56,7 +25,7 @@ for _, strategy in helpers.each_strategy() do
       })
 
       assert(bp.routes:insert({
-        hosts      = { "least1.com" },
+        hosts      = { "least1.test" },
         protocols  = { "http" },
         service    = bp.services:insert({
           protocol = "http",
@@ -72,30 +41,20 @@ for _, strategy in helpers.each_strategy() do
 
       assert(bp.targets:insert({
         upstream = upstream1,
-        target = "127.0.0.1:10001",
+        target = "127.0.0.1:" .. test_port1,
         weight = 100,
       }))
 
       assert(bp.targets:insert({
         upstream = upstream1,
-        target = "127.0.0.1:10002",
+        target = "127.0.0.1:" .. test_port2,
         weight = 100,
       }))
 
       assert(helpers.start_kong({
         database   = strategy,
         nginx_conf = "spec/fixtures/custom_nginx.template",
-      }, nil, nil, fixtures))
-    end)
-
-    before_each(function()
-      proxy_client = helpers.proxy_client()
-      admin_client = helpers.admin_client()
-    end)
-
-    after_each(function ()
-      proxy_client:close()
-      admin_client:close()
+      }))
     end)
 
     lazy_teardown(function()
@@ -103,9 +62,10 @@ for _, strategy in helpers.each_strategy() do
     end)
 
     it("balances by least-connections", function()
+      server1:start()
+      server2:start()
       local thread_max = 100 -- maximum number of threads to use
       local done = false
-      local results = {}
       local threads = {}
 
       local handler = function()
@@ -115,12 +75,10 @@ for _, strategy in helpers.each_strategy() do
             method = "GET",
             path = "/leastconnections",
             headers = {
-              ["Host"] = "least1.com"
+              ["Host"] = "least1.test"
             },
           }))
           assert(res.status == 200)
-          local body = tonumber(assert(res:read_body()))
-          results[body] = (results[body] or 0) + 1
           client:close()
         end
       end
@@ -133,7 +91,7 @@ for _, strategy in helpers.each_strategy() do
       -- wait while we're executing
       local finish_at = ngx.now() + 1.5
       repeat
-        ngx.sleep(0.1)
+        ngx.sleep(0.01)
       until ngx.now() >= finish_at
 
       -- finish up
@@ -142,9 +100,11 @@ for _, strategy in helpers.each_strategy() do
         ngx.thread.wait(threads[i])
       end
 
-      --assert.equal(results,false)
-      local ratio = results[100]/results[200]
-      assert.near(2, ratio, 0.8)
+      local results1 = server1:shutdown()
+      local results2 = server2:shutdown()
+      local ratio = results1.ok/results2.ok
+      assert.near(2, ratio, 1)
+      assert.is_not(ratio, 0)
     end)
 
     if strategy ~= "off" then
@@ -152,9 +112,7 @@ for _, strategy in helpers.each_strategy() do
         local api_client = helpers.admin_client()
 
         -- create a new target
-        local res = assert(api_client:send({
-          method = "POST",
-          path = "/upstreams/" .. upstream1_id .. "/targets",
+        local res = assert(api_client:post("/upstreams/" .. upstream1_id .. "/targets", {
           headers = {
             ["Content-Type"] = "application/json",
           },
@@ -185,14 +143,24 @@ for _, strategy in helpers.each_strategy() do
         end
         assert.is_true(found)
 
-        -- delete the target and assert that it still exists with weight == 0
+        -- update the target and assert that it still exists with weight == 0
         api_client = helpers.admin_client()
         res, err = api_client:send({
-          method = "DELETE",
+          method = "PATCH",
           path = "/upstreams/" .. upstream1_id .. "/targets/127.0.0.1:10003",
+          headers = {
+            ["Content-Type"] = "application/json",
+          },
+          body = {
+            weight = 0
+          },
         })
         assert.is_nil(err)
-        assert.same(204, res.status)
+        assert.same(200, res.status)
+        local json = assert.response(res).has.jsonbody()
+        assert.is_string(json.id)
+        assert.are.equal("127.0.0.1:10003", json.target)
+        assert.are.equal(0, json.weight)
         api_client:close()
 
         api_client = helpers.admin_client()
@@ -231,7 +199,7 @@ for _, strategy in helpers.each_strategy() do
         assert(helpers.start_kong({
           database   = strategy,
           nginx_conf = "spec/fixtures/custom_nginx.template",
-        }, nil, nil, fixtures))
+        }))
       end)
 
       lazy_teardown(function()
@@ -247,14 +215,12 @@ for _, strategy in helpers.each_strategy() do
         local api_client = helpers.admin_client()
 
         -- create a new target
-        local res = assert(api_client:send({
-          method = "POST",
-          path = "/upstreams/" .. an_upstream.id .. "/targets",
+        local res = assert(api_client:post("/upstreams/" .. an_upstream.id .. "/targets", {
           headers = {
             ["Content-Type"] = "application/json",
           },
           body = {
-            target = "127.0.0.1:10001",
+            target = "127.0.0.1:" .. test_port1,
             weight = 100
           },
         }))
@@ -273,18 +239,18 @@ for _, strategy in helpers.each_strategy() do
         api_client:close()
         local found = false
         for _, entry in ipairs(body.data) do
-          if entry.target == "127.0.0.1:10001" and entry.weight == 100 then
+          if entry.target == "127.0.0.1:" .. test_port1 and entry.weight == 100 then
             found = true
             break
           end
         end
         assert.is_true(found)
 
-        -- delete the target and assert that it still exists with weight == 0
+        -- delete the target and assert that it is gone
         api_client = helpers.admin_client()
         res, err = api_client:send({
           method = "DELETE",
-          path = "/upstreams/" .. an_upstream.id .. "/targets/127.0.0.1:10001",
+          path = "/upstreams/" .. an_upstream.id .. "/targets/127.0.0.1:" .. test_port1,
         })
         assert.is_nil(err)
         assert.same(204, res.status)
@@ -301,12 +267,12 @@ for _, strategy in helpers.each_strategy() do
         api_client:close()
         local found = false
         for _, entry in ipairs(body.data) do
-          if entry.target == "127.0.0.1:10001" and entry.weight == 0 then
+          if entry.target == "127.0.0.1:" .. test_port1 and entry.weight == 0 then
             found = true
             break
           end
         end
-        assert.is_true(found)
+        assert.is_false(found)
       end)
     end)
   end

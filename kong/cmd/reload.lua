@@ -1,28 +1,54 @@
 local prefix_handler = require "kong.cmd.utils.prefix_handler"
 local nginx_signals = require "kong.cmd.utils.nginx_signals"
 local conf_loader = require "kong.conf_loader"
+local kong_global = require "kong.global"
 local pl_path = require "pl.path"
+local pl_file = require "pl.file"
 local log = require "kong.cmd.utils.log"
+local DB = require "kong.db"
+
 
 local function execute(args)
   log.disable()
   -- retrieve prefix or use given one
-  local default_conf = assert(conf_loader(args.conf, {
+  local new_config = assert(conf_loader(args.conf, {
     prefix = args.prefix
   }))
   log.enable()
-  assert(pl_path.exists(default_conf.prefix),
-         "no such prefix: " .. default_conf.prefix)
+  assert(pl_path.exists(new_config.prefix),
+         "no such prefix: " .. new_config.prefix)
 
-  -- load <PREFIX>/kong.conf containing running node's config
-  local conf = assert(conf_loader(default_conf.kong_env, {
+  -- write a combined config file
+  if args.conf and pl_path.exists(args.conf) then
+    local kong_env = assert(pl_file.read(args.conf))
+    if pl_path.exists(new_config.kong_env) then
+      kong_env = assert(pl_file.read(new_config.kong_env)) .. "\n" .. kong_env
+    end
+
+    assert(prefix_handler.write_env_file(new_config.kong_env, kong_env))
+  end
+
+  local conf = assert(conf_loader(new_config.kong_env, {
     prefix = args.prefix
   }))
-  assert(prefix_handler.prepare_prefix(conf, args.nginx_conf))
+
+  if not new_config.declarative_config then
+    conf.declarative_config = nil
+  end
+
+  assert(prefix_handler.prepare_prefix(conf, args.nginx_conf, nil, true))
+
+  _G.kong = kong_global.new()
+  kong_global.init_pdk(_G.kong, conf)
+
+  local db = assert(DB.new(conf))
+  assert(db:init_connector())
 
   assert(nginx_signals.reload(conf))
+
   log("Kong reloaded")
 end
+
 
 local lapp = [[
 Usage: kong reload [OPTIONS]
@@ -40,6 +66,7 @@ Options:
  -p,--prefix      (optional string) prefix Kong is running at
  --nginx-conf     (optional string) custom Nginx configuration template
 ]]
+
 
 return {
   lapp = lapp,

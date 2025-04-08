@@ -3,6 +3,8 @@ local helpers = require "spec.helpers"
 local utils   = require "kong.tools.utils"
 local admin_api = require "spec.fixtures.admin_api"
 local sha256 = require "resty.sha256"
+local jwt_encoder = require "kong.plugins.jwt.jwt_parser"
+
 
 local math_random = math.random
 local string_char = string.char
@@ -11,6 +13,14 @@ local string_rep = string.rep
 
 
 local ngx_encode_base64 = ngx.encode_base64
+
+
+local PAYLOAD = {
+  iss = nil,
+  nbf = os.time(),
+  iat = os.time(),
+  exp = os.time() + 3600
+}
 
 
 local kong = {
@@ -141,6 +151,7 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
       "consumers",
       "plugins",
       "keyauth_credentials",
+      "jwt_secrets",
       "oauth2_credentials",
       "oauth2_authorization_codes",
       "oauth2_tokens",
@@ -359,6 +370,38 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
         service     = service16,
       }))
 
+
+      local service_grpc = assert(admin_api.services:insert {
+          name = "grpc",
+          url = helpers.grpcbin_url,
+        })
+
+      local route_grpc = assert(admin_api.routes:insert {
+        protocols = { "grpc", "grpcs" },
+        hosts     = { "oauth2_grpc.com" },
+        paths = { "/hello.HelloService/SayHello" },
+        service = service_grpc,
+      })
+
+      local route_provgrpc = assert(admin_api.routes:insert {
+        hosts     = { "oauth2_grpc.com" },
+        paths = { "/" },
+        service = service_grpc,
+      })
+
+      admin_api.oauth2_plugins:insert({
+        route = { id = route_grpc.id },
+        config   = {
+          scopes = { "email", "profile", "user.email" },
+        },
+      })
+      admin_api.oauth2_plugins:insert({
+        route = { id = route_provgrpc.id },
+        config   = {
+          scopes = { "email", "profile", "user.email" },
+        },
+      })
+
       admin_api.oauth2_plugins:insert({
         route = { id = route1.id },
         config   = { scopes = { "email", "profile", "user.email" } },
@@ -527,6 +570,18 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
           assert.are.equal("no-store", res.headers["cache-control"])
           assert.are.equal("no-cache", res.headers["pragma"])
         end)
+
+        it("rejects gRPC call without credentials", function()
+          local ok, err = helpers.proxy_client_grpcs(){
+            service = "hello.HelloService.SayHello",
+            opts = {
+              ["-authority"] = "oauth2.com",
+            },
+          }
+          assert.falsy(ok)
+          assert.match("Code: Unauthenticated", err)
+        end)
+
         it("returns an error when no parameter is being sent", function()
           local res = assert(proxy_ssl_client:send {
             method  = "POST",
@@ -1232,7 +1287,6 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
           assert.are.equal("email profile", body.headers["x-authenticated-scope"])
           assert.are.equal("userid123", body.headers["x-authenticated-userid"])
           assert.are.equal("clientid123", body.headers["x-credential-identifier"])
-          assert.are.equal(nil, body.headers["x-credential-username"])
         end)
       end)
 
@@ -1274,6 +1328,39 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
           local body = assert.res_status(400, res)
           local json = cjson.decode(body)
           assert.same({ error_description = "Invalid client authentication", error = "invalid_client" }, json)
+        end)
+        it("returns an error when missing client_id and missing client_secret is sent", function()
+          local res = assert(proxy_ssl_client:send {
+            method  = "POST",
+            path    = "/oauth2/token",
+            body    = {
+              scope            = "email",
+              response_type    = "token",
+              grant_type       = "client_credentials",
+            },
+            headers = {
+              ["Host"]         = "oauth2_4.com",
+              ["Content-Type"] = "application/json"
+            }
+          })
+          local body = assert.res_status(400, res)
+          local json = cjson.decode(body)
+          assert.same({ error_description = "Invalid client authentication", error = "invalid_client" }, json)
+        end)
+        it("returns an error when empty client_id and empty client_secret is sent regardless of method", function()
+          local res = assert(proxy_ssl_client:send {
+            method  = "GET",
+            path    = "/oauth2/token?client_id&grant_type=client_credentials&client_secret",
+            body    = {},
+            headers = {
+              ["Host"]         = "oauth2_4.com",
+              ["Content-Type"] = "application/json"
+            }
+          })
+          local body = assert.res_status(405, res)
+          local json = cjson.decode(body)
+          assert.same({ error_description = "The HTTP method GET is invalid for the token endpoint",
+                        error = "invalid_method" }, json)
         end)
         it("returns an error when grant_type is not sent", function()
           local res = assert(proxy_ssl_client:send {
@@ -1372,7 +1459,11 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
             }
           })
           local body = assert.res_status(200, res)
-          assert.is_table(ngx.re.match(body, [[^\{"token_type":"bearer","access_token":"[\w]{32,32}","expires_in":5\}$]]))
+          local json = cjson.decode(body)
+          assert.equal("bearer", json.token_type)
+          assert.equal(5, json.expires_in)
+          assert.equal(32, #json.access_token)
+          assert.matches("%w+", json.access_token)
         end)
         it("returns success with an application that has multiple redirect_uri", function()
           local res = assert(proxy_ssl_client:send {
@@ -1390,7 +1481,11 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
             }
           })
           local body = assert.res_status(200, res)
-          assert.is_table(ngx.re.match(body, [[^\{"token_type":"bearer","access_token":"[\w]{32,32}","expires_in":5\}$]]))
+          local json = cjson.decode(body)
+          assert.equal("bearer", json.token_type)
+          assert.equal(5, json.expires_in)
+          assert.equal(32, #json.access_token)
+          assert.matches("%w+", json.access_token)
         end)
         it("returns success with an application that has multiple redirect_uri, and by passing a valid redirect_uri", function()
           local res = assert(proxy_ssl_client:send {
@@ -1409,7 +1504,11 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
             }
           })
           local body = assert.res_status(200, res)
-          assert.is_table(ngx.re.match(body, [[^\{"token_type":"bearer","access_token":"[\w]{32,32}","expires_in":5\}$]]))
+          local json = cjson.decode(body)
+          assert.equal("bearer", json.token_type)
+          assert.equal(5, json.expires_in)
+          assert.equal(32, #json.access_token)
+          assert.matches("%w+", json.access_token)
         end)
         it("returns success with an application that has not redirect_uri", function()
           local res = assert(proxy_ssl_client:send {
@@ -1427,7 +1526,11 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
             }
           })
           local body = assert.res_status(200, res)
-          assert.is_table(ngx.re.match(body, [[^\{"token_type":"bearer","access_token":"[\w]{32,32}","expires_in":5\}$]]))
+          local json = cjson.decode(body)
+          assert.equal("bearer", json.token_type)
+          assert.equal(5, json.expires_in)
+          assert.equal(32, #json.access_token)
+          assert.matches("%w+", json.access_token)
         end)
         it("returns success with authenticated_userid and valid provision_key", function()
           local res = assert(proxy_ssl_client:send {
@@ -1447,7 +1550,11 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
             }
           })
           local body = assert.res_status(200, res)
-          assert.is_table(ngx.re.match(body, [[^\{"token_type":"bearer","access_token":"[\w]{32,32}","expires_in":5\}$]]))
+          local json = cjson.decode(body)
+          assert.equal("bearer", json.token_type)
+          assert.equal(5, json.expires_in)
+          assert.equal(32, #json.access_token)
+          assert.matches("%w+", json.access_token)
         end)
         it("returns success with authorization header", function()
           local res = assert(proxy_ssl_client:send {
@@ -1464,7 +1571,11 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
             }
           })
           local body = assert.res_status(200, res)
-          assert.is_table(ngx.re.match(body, [[^\{"token_type":"bearer","access_token":"[\w]{32,32}","expires_in":5\}$]]))
+          local json = cjson.decode(body)
+          assert.equal("bearer", json.token_type)
+          assert.equal(5, json.expires_in)
+          assert.equal(32, #json.access_token)
+          assert.matches("%w+", json.access_token)
         end)
         it("returns success with authorization header and client_id body param", function()
           local res = assert(proxy_ssl_client:send {
@@ -1482,7 +1593,11 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
             }
           })
           local body = assert.res_status(200, res)
-          assert.is_table(ngx.re.match(body, [[^\{"token_type":"bearer","access_token":"[\w]{32,32}","expires_in":5\}$]]))
+          local json = cjson.decode(body)
+          assert.equal("bearer", json.token_type)
+          assert.equal(5, json.expires_in)
+          assert.equal(32, #json.access_token)
+          assert.matches("%w+", json.access_token)
         end)
         it("returns an error with a wrong authorization header", function()
           local res = assert(proxy_ssl_client:send {
@@ -1535,7 +1650,6 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
           assert.are.equal("email", body.headers["x-authenticated-scope"])
           assert.are.equal("hello", body.headers["x-authenticated-userid"])
           assert.are.equal("clientid123", body.headers["x-credential-identifier"])
-          assert.are.equal(nil, body.headers["x-credential-username"])
         end)
         it("works in a multipart request", function()
           local res = assert(proxy_ssl_client:send {
@@ -1698,7 +1812,13 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
             }
           })
           local body = assert.res_status(200, res)
-          assert.is_table(ngx.re.match(body, [[^\{"refresh_token":"[\w]{32,32}","token_type":"bearer","access_token":"[\w]{32,32}","expires_in":5\}$]]))
+          local json = cjson.decode(body)
+          assert.equal("bearer", json.token_type)
+          assert.equal(5, json.expires_in)
+          assert.equal(32, #json.access_token)
+          assert.matches("%w+", json.access_token)
+          assert.equal(32, #json.refresh_token)
+          assert.matches("%w+", json.refresh_token)
         end)
         it("returns success with authorization header", function()
           local res = assert(proxy_ssl_client:send {
@@ -1717,7 +1837,13 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
             }
           })
           local body = assert.res_status(200, res)
-          assert.is_table(ngx.re.match(body, [[^\{"refresh_token":"[\w]{32,32}","token_type":"bearer","access_token":"[\w]{32,32}","expires_in":5\}$]]))
+          local json = cjson.decode(body)
+          assert.equal("bearer", json.token_type)
+          assert.equal(5, json.expires_in)
+          assert.equal(32, #json.access_token)
+          assert.matches("%w+", json.access_token)
+          assert.equal(32, #json.refresh_token)
+          assert.matches("%w+", json.refresh_token)
         end)
         it("returns an error with a wrong authorization header", function()
           local res = assert(proxy_ssl_client:send {
@@ -1771,7 +1897,6 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
           assert.are.equal("email", body.headers["x-authenticated-scope"])
           assert.are.equal("id123", body.headers["x-authenticated-userid"])
           assert.are.equal("clientid123", body.headers["x-credential-identifier"])
-          assert.are.equal(nil, body.headers["x-credential-username"])
         end)
       end)
     end)
@@ -1894,7 +2019,13 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
           }
         })
         local body = assert.res_status(200, res)
-        assert.is_table(ngx.re.match(body, [[^\{"refresh_token":"[\w]{32,32}","token_type":"bearer","access_token":"[\w]{32,32}","expires_in":5\}$]]))
+        local json = cjson.decode(body)
+        assert.equal("bearer", json.token_type)
+        assert.equal(5, json.expires_in)
+        assert.equal(32, #json.access_token)
+        assert.matches("%w+", json.access_token)
+        assert.equal(32, #json.refresh_token)
+        assert.matches("%w+", json.refresh_token)
       end)
       it("returns success with state", function()
         local code = provision_code()
@@ -1915,7 +2046,13 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
           }
         })
         local body = assert.res_status(200, res)
-        assert.is_table(ngx.re.match(body, [[^\{"refresh_token":"[\w]{32,32}","token_type":"bearer","state":"wot","access_token":"[\w]{32,32}","expires_in":5\}$]]))
+        local json = cjson.decode(body)
+        assert.equal("bearer", json.token_type)
+        assert.equal(5, json.expires_in)
+        assert.equal(32, #json.access_token)
+        assert.matches("%w+", json.access_token)
+        assert.equal(32, #json.refresh_token)
+        assert.matches("%w+", json.refresh_token)
       end)
       it("fails when the client used for the code is not the same client used for the token", function()
         local code = provision_code(nil, nil, "clientid333")
@@ -1969,7 +2106,6 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
         assert.are.equal("email", body.headers["x-authenticated-scope"])
         assert.are.equal("userid123", body.headers["x-authenticated-userid"])
         assert.are.equal("clientid123", body.headers["x-credential-identifier"])
-        assert.are.equal(nil, body.headers["x-credential-username"])
       end)
       it("fails when an authorization code is used more than once", function()
         local code = provision_code()
@@ -1989,7 +2125,13 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
             }
           })
           local body = assert.res_status(200, res)
-          assert.is_table(ngx.re.match(body, [[^\{"refresh_token":"[\w]{32,32}","token_type":"bearer","access_token":"[\w]{32,32}","expires_in":5\}$]]))
+          local json = cjson.decode(body)
+          assert.equal("bearer", json.token_type)
+          assert.equal(5, json.expires_in)
+          assert.equal(32, #json.access_token)
+          assert.matches("%w+", json.access_token)
+          assert.equal(32, #json.refresh_token)
+          assert.matches("%w+", json.refresh_token)
 
           local res = assert(proxy_ssl_client:send {
             method  = "POST",
@@ -2068,7 +2210,13 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
           }
         })
         local body = assert.res_status(200, res)
-        assert.is_table(ngx.re.match(body, [[^\{"refresh_token":"[\w]{32,32}","token_type":"bearer","access_token":"[\w]{32,32}","expires_in":5\}$]]))
+        local json = cjson.decode(body)
+        assert.equal("bearer", json.token_type)
+        assert.equal(5, json.expires_in)
+        assert.equal(32, #json.access_token)
+        assert.matches("%w+", json.access_token)
+        assert.equal(32, #json.refresh_token)
+        assert.matches("%w+", json.refresh_token)
       end)
       it("succeeds when authorization header used for public app", function()
         local challenge, verifier = get_pkce_tokens()
@@ -2088,7 +2236,13 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
           }
         })
         local body = assert.res_status(200, res)
-        assert.is_table(ngx.re.match(body, [[^\{"refresh_token":"[\w]{32,32}","token_type":"bearer","access_token":"[\w]{32,32}","expires_in":5\}$]]))
+        local json = cjson.decode(body)
+        assert.equal("bearer", json.token_type)
+        assert.equal(5, json.expires_in)
+        assert.equal(32, #json.access_token)
+        assert.matches("%w+", json.access_token)
+        assert.equal(32, #json.refresh_token)
+        assert.matches("%w+", json.refresh_token)
       end)
       it("succeeds when authorization header used for public app with colon", function()
         local challenge, verifier = get_pkce_tokens()
@@ -2108,7 +2262,13 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
           }
         })
         local body = assert.res_status(200, res)
-        assert.is_table(ngx.re.match(body, [[^\{"refresh_token":"[\w]{32,32}","token_type":"bearer","access_token":"[\w]{32,32}","expires_in":5\}$]]))
+        local json = cjson.decode(body)
+        assert.equal("bearer", json.token_type)
+        assert.equal(5, json.expires_in)
+        assert.equal(32, #json.access_token)
+        assert.matches("%w+", json.access_token)
+        assert.equal(32, #json.refresh_token)
+        assert.matches("%w+", json.refresh_token)
       end)
       it("succeeds when authorization header used for public app with empty secret", function()
         local challenge, verifier = get_pkce_tokens()
@@ -2128,7 +2288,13 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
           }
         })
         local body = assert.res_status(200, res)
-        assert.is_table(ngx.re.match(body, [[^\{"refresh_token":"[\w]{32,32}","token_type":"bearer","access_token":"[\w]{32,32}","expires_in":5\}$]]))
+        local json = cjson.decode(body)
+        assert.equal("bearer", json.token_type)
+        assert.equal(5, json.expires_in)
+        assert.equal(32, #json.access_token)
+        assert.matches("%w+", json.access_token)
+        assert.equal(32, #json.refresh_token)
+        assert.matches("%w+", json.refresh_token)
       end)
       it("fails when a secret provided for public app", function()
         local challenge, verifier = get_pkce_tokens()
@@ -2210,7 +2376,13 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
           }
         })
         local body = assert.res_status(200, res)
-        assert.is_table(ngx.re.match(body, [[^\{"refresh_token":"[\w]{32,32}","token_type":"bearer","access_token":"[\w]{32,32}","expires_in":5\}$]]))
+        local json = cjson.decode(body)
+        assert.equal("bearer", json.token_type)
+        assert.equal(5, json.expires_in)
+        assert.equal(32, #json.access_token)
+        assert.matches("%w+", json.access_token)
+        assert.equal(32, #json.refresh_token)
+        assert.matches("%w+", json.refresh_token)
       end)
       it("success when code challenge contains padding", function()
         local code_verifier = "abcdelfhigklmnopqrstuvwxyz0123456789abcdefg"
@@ -2231,7 +2403,13 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
           }
         })
         local body = assert.res_status(200, res)
-        assert.is_table(ngx.re.match(body, [[^\{"refresh_token":"[\w]{32,32}","token_type":"bearer","access_token":"[\w]{32,32}","expires_in":5\}$]]))
+        local json = cjson.decode(body)
+        assert.equal("bearer", json.token_type)
+        assert.equal(5, json.expires_in)
+        assert.equal(32, #json.access_token)
+        assert.matches("%w+", json.access_token)
+        assert.equal(32, #json.refresh_token)
+        assert.matches("%w+", json.refresh_token)
       end)
       it("succeeds when code challenge contains + or / characters", function()
         local code_verifier = "abcdelfhigklmnopqrstuvwxyz0123456789abcdefghijklmnop9"
@@ -2252,7 +2430,13 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
           }
         })
         local body = assert.res_status(200, res)
-        assert.is_table(ngx.re.match(body, [[^\{"refresh_token":"[\w]{32,32}","token_type":"bearer","access_token":"[\w]{32,32}","expires_in":5\}$]]))
+        local json = cjson.decode(body)
+        assert.equal("bearer", json.token_type)
+        assert.equal(5, json.expires_in)
+        assert.equal(32, #json.access_token)
+        assert.matches("%w+", json.access_token)
+        assert.equal(32, #json.refresh_token)
+        assert.matches("%w+", json.refresh_token)
       end)
       it("fails when code verifier is greater than 128 characters", function()
         local code_verifier = string_rep("abc123", 30)
@@ -2560,7 +2744,13 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
           }
         })
         local body = assert.res_status(200, res)
-        assert.is_table(ngx.re.match(body, [[^\{"refresh_token":"[\w]{32,32}","token_type":"bearer","access_token":"[\w]{32,32}","expires_in":5\}$]]))
+        local json = cjson.decode(body)
+        assert.equal("bearer", json.token_type)
+        assert.equal(5, json.expires_in)
+        assert.equal(32, #json.access_token)
+        assert.matches("%w+", json.access_token)
+        assert.equal(32, #json.refresh_token)
+        assert.matches("%w+", json.refresh_token)
       end)
       it("suceeds when no code verifier provided for confidential app without pkce when conf.pkce is lax", function()
         local code = provision_code()
@@ -2579,7 +2769,13 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
           }
         })
         local body = assert.res_status(200, res)
-        assert.is_table(ngx.re.match(body, [[^\{"refresh_token":"[\w]{32,32}","token_type":"bearer","access_token":"[\w]{32,32}","expires_in":5\}$]]))
+        local json = cjson.decode(body)
+        assert.equal("bearer", json.token_type)
+        assert.equal(5, json.expires_in)
+        assert.equal(32, #json.access_token)
+        assert.matches("%w+", json.access_token)
+        assert.equal(32, #json.refresh_token)
+        assert.matches("%w+", json.refresh_token)
       end)
     end)
 
@@ -2695,12 +2891,9 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
         --
         -- We want to make sure we do not attempt to parse a
         -- request body if the request isn't supposed to have
-        -- once in the first place.
+        -- one in the first place.
 
-        -- setup: cleanup logs
-
-        local test_error_log_path = helpers.test_conf.nginx_err_logs
-        os.execute(":> " .. test_error_log_path)
+        helpers.clean_logfile()
 
         -- TEST: access with a GET request
 
@@ -2718,13 +2911,7 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
         -- Assertion: there should be no [error], including no error
         -- resulting from an invalid request body parsing that were
         -- previously thrown.
-
-        local pl_file = require "pl.file"
-        local logs = pl_file.read(test_error_log_path)
-
-        for line in logs:gmatch("[^\r\n]+") do
-          assert.not_match("[error]", line, nil, true)
-        end
+        assert.logfile().has.no.line("[error]", true)
       end)
       it("works when a correct access_token is being sent in an authorization header (bearer)", function()
         local token = provision_token()
@@ -2758,9 +2945,24 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
         assert.are.equal("userid123", body.headers["x-authenticated-userid"])
         assert.are.equal("email", body.headers["x-authenticated-scope"])
         assert.are.equal("clientid123", body.headers["x-credential-identifier"])
-        assert.are.equal(nil, body.headers["x-credential-username"])
         assert.is_nil(body.headers["x-anonymous-consumer"])
       end)
+
+      it("accepts gRPC call with credentials", function()
+        local token = provision_token("oauth2_grpc.com")
+
+        local ok, res = helpers.proxy_client_grpcs(){
+          service = "hello.HelloService.SayHello",
+          opts = {
+            ["-authority"] = "oauth2_grpc.com",
+            ["-H"] = ("'authorization: bearer %s'"):format(token.access_token),
+          },
+        }
+        assert.truthy(ok)
+        assert.same({ reply = "hello noname" }, cjson.decode(res))
+      end)
+
+
       it("returns HTTP 400 when scope is not a string", function()
         local invalid_values = {
           { "email" },
@@ -2811,7 +3013,6 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
         assert.are.equal("userid123", body.headers["x-authenticated-userid"])
         assert.are.equal("email", body.headers["x-authenticated-scope"])
         assert.are.equal("clientid123", body.headers["x-credential-identifier"])
-        assert.are.equal(nil, body.headers["x-credential-username"])
         assert.is_nil(body.headers["x-anonymous-consumer"])
       end)
       it("works with wrong credentials and anonymous", function()
@@ -2826,7 +3027,6 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
         assert.are.equal("true", body.headers["x-anonymous-consumer"])
         assert.equal('no-body', body.headers["x-consumer-username"])
         assert.are.equal(nil, body.headers["x-credential-identifier"])
-        assert.are.equal(nil, body.headers["x-credential-username"])
 
       end)
       it("works with wrong credentials and username in anonymous", function()
@@ -3066,7 +3266,13 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
           }
         })
         local body = assert.res_status(200, res)
-        assert.is_table(ngx.re.match(body, [[^\{"refresh_token":"[\w]{32,32}","token_type":"bearer","access_token":"[\w]{32,32}","expires_in":5\}$]]))
+        local json = cjson.decode(body)
+        assert.equal("bearer", json.token_type)
+        assert.equal(5, json.expires_in)
+        assert.equal(32, #json.access_token)
+        assert.matches("%w+", json.access_token)
+        assert.equal(32, #json.refresh_token)
+        assert.matches("%w+", json.refresh_token)
       end)
       it("refreshes public app without a secret", function()
         local challenge, verifier = get_pkce_tokens()
@@ -3085,7 +3291,13 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
           }
         })
         local body = assert.res_status(200, res)
-        assert.is_table(ngx.re.match(body, [[^\{"refresh_token":"[\w]{32,32}","token_type":"bearer","access_token":"[\w]{32,32}","expires_in":5\}$]]))
+        local json = cjson.decode(body)
+        assert.equal("bearer", json.token_type)
+        assert.equal(5, json.expires_in)
+        assert.equal(32, #json.access_token)
+        assert.matches("%w+", json.access_token)
+        assert.equal(32, #json.refresh_token)
+        assert.matches("%w+", json.refresh_token)
       end)
       it("fails to refresh when a secret provided for public app", function()
         local challenge, verifier = get_pkce_tokens()
@@ -3202,7 +3414,13 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
           }
         })
         local body = assert.res_status(200, res)
-        assert.is_table(ngx.re.match(body, [[^\{"refresh_token":"[\w]{32,32}","token_type":"bearer","access_token":"[\w]{32,32}","expires_in":5\}$]]))
+        local json = cjson.decode(body)
+        assert.equal("bearer", json.token_type)
+        assert.equal(5, json.expires_in)
+        assert.equal(32, #json.access_token)
+        assert.matches("%w+", json.access_token)
+        assert.equal(32, #json.refresh_token)
+        assert.matches("%w+", json.refresh_token)
 
         assert.falsy(token.access_token  == cjson.decode(body).access_token)
         assert.falsy(token.refresh_token == cjson.decode(body).refresh_token)
@@ -3410,6 +3628,7 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
     local user2
     local anonymous
     local keyauth
+    local jwt_secret
 
     lazy_setup(function()
       local service1 = admin_api.services:insert({
@@ -3454,8 +3673,22 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
         service    = service2
       }))
 
+      local route3 = assert(admin_api.routes:insert({
+        hosts      = { "logical-or-jwt.com" },
+        protocols  = { "http", "https" },
+        service    = service2
+      }))
+
       admin_api.oauth2_plugins:insert({
         route = { id = route2.id },
+        config   = {
+          scopes    = { "email", "profile", "user.email" },
+          anonymous = anonymous.id,
+        },
+      })
+
+      admin_api.oauth2_plugins:insert({
+        route = { id = route3.id },
         config   = {
           scopes    = { "email", "profile", "user.email" },
           anonymous = anonymous.id,
@@ -3470,9 +3703,21 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
         },
       }
 
+      admin_api.plugins:insert {
+        name     = "jwt",
+        route = { id = route3.id },
+        config   = {
+          anonymous = anonymous.id,
+        },
+      }
+
       keyauth = admin_api.keyauth_credentials:insert({
         key      = "Mouse",
         consumer = { id = user1.id },
+      })
+
+      jwt_secret = admin_api.jwt_secrets:insert({
+        consumer = { id = user1.id }
       })
 
       admin_api.oauth2_credentials:insert {
@@ -3516,7 +3761,6 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
 
         local client_id = assert.request(res).has.header("x-credential-identifier")
         assert.equal(keyauth.id, client_id)
-        assert.request(res).has.no.header("x-credential-username")
       end)
 
       it("fails 401, with only the first credential provided", function()
@@ -3581,18 +3825,20 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
         assert(id == user1.id or id == user2.id)
         local client_id = assert.request(res).has.header("x-credential-identifier")
         assert.equal("clientid4567", client_id)
-        assert.request(res).has.no.header("x-credential-username")
       end)
 
-      it("passes with only the first credential provided", function()
+      it("passes with only the first credential provided (higher priority)", function()
         local res = assert(proxy_client:send {
           method  = "GET",
           path = "/request",
           headers = {
             ["Host"] = "logical-or.com",
             ["apikey"] = "Mouse",
+            ["X-Authenticated-Scope"] = "all-access",
+            ["X-Authenticated-UserId"] = "admin",
           }
         })
+
         assert.response(res).has.status(200)
         assert.request(res).has.no.header("x-anonymous-consumer")
         local id = assert.request(res).has.header("x-consumer-id")
@@ -3600,7 +3846,34 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
         assert.equal(user1.id, id)
         local client_id = assert.request(res).has.header("x-credential-identifier")
         assert.equal(keyauth.id, client_id)
-        assert.request(res).has.no.header("x-credential-username")
+        assert.request(res).has.no.header("x-authenticated-scope")
+        assert.request(res).has.no.header("x-authenticated-userid")
+      end)
+
+      it("passes with only the first credential provided (lower priority)", function()
+        PAYLOAD.iss = jwt_secret.key
+        local jwt = jwt_encoder.encode(PAYLOAD, jwt_secret.secret)
+        local authorization = "Bearer " .. jwt
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          path = "/request",
+          headers = {
+            ["Host"] = "logical-or-jwt.com",
+            ["Authorization"] = authorization,
+            ["X-Authenticated-Scope"] = "all-access",
+            ["X-Authenticated-UserId"] = "admin",
+          }
+        })
+
+        assert.response(res).has.status(200)
+        assert.request(res).has.no.header("x-anonymous-consumer")
+        local id = assert.request(res).has.header("x-consumer-id")
+        assert.not_equal(id, anonymous.id)
+        assert.equal(user1.id, id)
+        local client_id = assert.request(res).has.header("x-credential-identifier")
+        assert.equal(jwt_secret.key, client_id)
+        assert.request(res).has.no.header("x-authenticated-scope")
+        assert.request(res).has.no.header("x-authenticated-userid")
       end)
 
       it("passes with only the second credential provided", function()
@@ -3621,7 +3894,6 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
         assert.equal(user2.id, id)
         local client_id = assert.request(res).has.header("x-credential-identifier")
         assert.equal("clientid4567", client_id)
-        assert.request(res).has.no.header("x-credential-username")
       end)
 
       it("passes with no credential provided", function()
@@ -3637,7 +3909,6 @@ describe("Plugin: oauth2 [#" .. strategy .. "]", function()
         local id = assert.request(res).has.header("x-consumer-id")
         assert.equal(id, anonymous.id)
         assert.request(res).has.no.header("x-credential-identifier")
-        assert.request(res).has.no.header("x-credential-username")
       end)
     end)
   end)

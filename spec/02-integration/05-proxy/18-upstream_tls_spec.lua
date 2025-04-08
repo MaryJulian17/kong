@@ -19,6 +19,7 @@ local fixtures = {
           keepalive_requests     0;
 
           location = / {
+              add_header 'X-Cert' $ssl_client_escaped_cert;
               echo 'it works';
           }
       }
@@ -54,7 +55,9 @@ for _, strategy in helpers.each_strategy() do
     local proxy_client, admin_client
     local bp
     local service_mtls, service_tls
-    local certificate, ca_certificate
+    local certificate, certificate_bad, ca_certificate
+    local upstream
+    local service_mtls_upstream
 
     lazy_setup(function()
       bp = helpers.get_db_utils(strategy, {
@@ -62,6 +65,8 @@ for _, strategy in helpers.each_strategy() do
         "services",
         "certificates",
         "ca_certificates",
+        "upstreams",
+        "targets",
       })
 
       service_mtls = assert(bp.services:insert({
@@ -74,9 +79,28 @@ for _, strategy in helpers.each_strategy() do
         url = "https://example.com:16799/", -- domain name needed for hostname check
       }))
 
+      upstream = assert(bp.upstreams:insert({
+        name = "backend-mtls",
+      }))
+
+      assert(bp.targets:insert({
+        upstream = { id = upstream.id, },
+        target = "127.0.0.1:16798",
+      }))
+
+      service_mtls_upstream = assert(bp.services:insert({
+        name = "protected-service-mtls-upstream",
+        url = "https://backend-mtls/",
+      }))
+
       certificate = assert(bp.certificates:insert({
         cert = ssl_fixtures.cert_client,
         key = ssl_fixtures.key_client,
+      }))
+
+      certificate_bad = assert(bp.certificates:insert({
+        cert = ssl_fixtures.cert, -- this cert is *not* trusted by upstream
+        key = ssl_fixtures.key,
       }))
 
       ca_certificate = assert(bp.ca_certificates:insert({
@@ -93,6 +117,12 @@ for _, strategy in helpers.each_strategy() do
         service = { id = service_tls.id, },
         hosts = { "example.com", },
         paths = { "/tls", },
+      }))
+
+      assert(bp.routes:insert({
+        service = { id = service_mtls_upstream.id, },
+        hosts = { "example.com", },
+        paths = { "/mtls-upstream", },
       }))
 
       assert(helpers.start_kong({
@@ -112,7 +142,7 @@ for _, strategy in helpers.each_strategy() do
       helpers.stop_kong()
     end)
 
-    describe("mutual TLS authentication against upstream", function()
+    describe("mutual TLS authentication against upstream with Service object", function()
       describe("no client certificate supplied", function()
         it("accessing protected upstream", function()
           local res = assert(proxy_client:send {
@@ -140,15 +170,49 @@ for _, strategy in helpers.each_strategy() do
         end)
 
         it("accessing protected upstream", function()
+          helpers.wait_until(function()
+            local res = assert(proxy_client:send {
+              path    = "/mtls",
+              headers = {
+                ["Host"] = "example.com",
+              }
+            })
+
+            return pcall(function()
+              local body = assert.res_status(200, res)
+              assert.equals("it works", body)
+            end)
+          end, 10)
+        end)
+
+        it("send updated client certificate", function ()
           local res = assert(proxy_client:send {
             path    = "/mtls",
             headers = {
               ["Host"] = "example.com",
             }
           })
+          assert.res_status(200, res)
+          local res_cert = res.headers["X-Cert"]
 
-          local body = assert.res_status(200, res)
-          assert.equals("it works", body)
+          res = admin_client:patch("/certificates/" .. certificate.id, {
+            body = {
+              cert = ssl_fixtures.cert_client2,
+              key = ssl_fixtures.key_client2,
+            },
+            headers = { ["Content-Type"] = "application/json" }
+          })
+          assert.res_status(200, res)
+
+          res = assert(proxy_client:send {
+            path    = "/mtls",
+            headers = {
+              ["Host"] = "example.com",
+            }
+          })
+          assert.res_status(200, res)
+          local res_cert2 = res.headers["X-Cert"]
+          assert.not_equals(res_cert, res_cert2)
         end)
 
         it("remove client_certificate removes access", function()
@@ -161,8 +225,30 @@ for _, strategy in helpers.each_strategy() do
 
           assert.res_status(200, res)
 
-          res = assert(proxy_client:send {
-            path    = "/mtls",
+          local body
+          helpers.wait_until(function()
+            res = assert(proxy_client:send {
+              path    = "/mtls",
+              headers = {
+                ["Host"] = "example.com",
+              }
+            })
+
+            return pcall(function()
+              body = assert.res_status(400, res)
+            end)
+          end, 10)
+
+          assert.matches("400 No required SSL certificate was sent", body, nil, true)
+        end)
+      end)
+    end)
+
+    describe("mutual TLS authentication against upstream with Upstream object", function()
+      describe("no client certificate supplied", function()
+        it("accessing protected upstream", function()
+          local res = assert(proxy_client:send {
+            path    = "/mtls-upstream",
             headers = {
               ["Host"] = "example.com",
             }
@@ -170,6 +256,100 @@ for _, strategy in helpers.each_strategy() do
 
           local body = assert.res_status(400, res)
           assert.matches("400 No required SSL certificate was sent", body, nil, true)
+        end)
+      end)
+
+      describe("#db client certificate supplied via upstream.client_certificate", function()
+        lazy_setup(function()
+          local res = assert(admin_client:patch("/upstreams/" .. upstream.id, {
+            body = {
+              client_certificate = { id = certificate.id, },
+            },
+            headers = { ["Content-Type"] = "application/json" },
+          }))
+
+          assert.res_status(200, res)
+        end)
+
+        it("accessing protected upstream", function()
+          helpers.wait_until(function()
+            local res = assert(proxy_client:send {
+              path    = "/mtls-upstream",
+              headers = {
+                ["Host"] = "example.com",
+              }
+            })
+
+            return pcall(function()
+              local body = assert.res_status(200, res)
+              assert.equals("it works", body)
+            end)
+          end, 10)
+        end)
+
+        it("remove client_certificate removes access", function()
+          local res = assert(admin_client:patch("/upstreams/" .. upstream.id, {
+            body = {
+              client_certificate = ngx.null,
+            },
+            headers = { ["Content-Type"] = "application/json" },
+          }))
+
+          assert.res_status(200, res)
+
+          local body
+          helpers.wait_until(function()
+            res = assert(proxy_client:send {
+              path    = "/mtls-upstream",
+              headers = {
+                ["Host"] = "example.com",
+              }
+            })
+
+            return pcall(function()
+              body = assert.res_status(400, res)
+            end)
+          end, 10)
+
+          assert.matches("400 No required SSL certificate was sent", body, nil, true)
+        end)
+      end)
+
+      describe("#db when both Service.client_certificate and Upstream.client_certificate are set, Service.client_certificate takes precedence", function()
+        lazy_setup(function()
+          local res = assert(admin_client:patch("/upstreams/" .. upstream.id, {
+            body = {
+              client_certificate = { id = certificate_bad.id, },
+            },
+            headers = { ["Content-Type"] = "application/json" },
+          }))
+
+          assert.res_status(200, res)
+
+          res = assert(admin_client:patch("/services/" .. service_mtls_upstream.id, {
+            body = {
+              client_certificate = { id = certificate.id, },
+            },
+            headers = { ["Content-Type"] = "application/json" },
+          }))
+
+          assert.res_status(200, res)
+        end)
+
+        it("access is allowed because Service.client_certificate overrides Upstream.client_certificate", function()
+          helpers.wait_until(function()
+            local res = assert(proxy_client:send {
+              path    = "/mtls-upstream",
+              headers = {
+                ["Host"] = "example.com",
+              }
+            })
+
+            return pcall(function()
+              local body = assert.res_status(200, res)
+              assert.equals("it works", body)
+            end)
+          end, 10)
         end)
       end)
     end)
@@ -198,14 +378,20 @@ for _, strategy in helpers.each_strategy() do
 
           assert.res_status(200, res)
 
-          res = assert(proxy_client:send {
-            path    = "/tls",
-            headers = {
-              ["Host"] = "example.com",
-            }
-          })
+          local body
+          helpers.wait_until(function()
+            res = assert(proxy_client:send {
+              path    = "/tls",
+              headers = {
+                ["Host"] = "example.com",
+              }
+            })
 
-          local body = assert.res_status(502, res)
+            return pcall(function()
+              body = assert.res_status(502, res)
+            end)
+          end, 10)
+
           assert.equals("An invalid response was received from the upstream server", body)
         end)
       end)
@@ -222,14 +408,20 @@ for _, strategy in helpers.each_strategy() do
 
           assert.res_status(200, res)
 
-          res = assert(proxy_client:send {
-            path    = "/tls",
-            headers = {
-              ["Host"] = "example.com",
-            }
-          })
+          local body
+          helpers.wait_until(function()
+            res = assert(proxy_client:send {
+              path    = "/tls",
+              headers = {
+                ["Host"] = "example.com",
+              }
+            })
 
-          local body = assert.res_status(200, res)
+            return pcall(function()
+              body = assert.res_status(200, res)
+            end)
+          end, 10)
+
           assert.equals("it works", body)
         end)
       end)
@@ -257,14 +449,20 @@ for _, strategy in helpers.each_strategy() do
 
           assert.res_status(200, res)
 
-          res = assert(proxy_client:send {
-            path    = "/tls",
-            headers = {
-              ["Host"] = "example.com",
-            }
-          })
+          local body
+          helpers.wait_until(function()
+            res = assert(proxy_client:send {
+              path    = "/tls",
+              headers = {
+                ["Host"] = "example.com",
+              }
+            })
 
-          local body = assert.res_status(502, res)
+            return pcall(function()
+              body = assert.res_status(502, res)
+            end)
+          end, 10)
+
           assert.equals("An invalid response was received from the upstream server", body)
         end)
 
@@ -278,14 +476,20 @@ for _, strategy in helpers.each_strategy() do
 
           assert.res_status(200, res)
 
-          res = assert(proxy_client:send {
-            path    = "/tls",
-            headers = {
-              ["Host"] = "example.com",
-            }
-          })
+          local body
+          helpers.wait_until(function()
+            res = assert(proxy_client:send {
+              path    = "/tls",
+              headers = {
+                ["Host"] = "example.com",
+              }
+            })
 
-          local body = assert.res_status(200, res)
+            return pcall(function()
+              body = assert.res_status(200, res)
+            end)
+          end, 10)
+
           assert.equals("it works", body)
         end)
       end)

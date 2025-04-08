@@ -1,6 +1,7 @@
 -- Copyright (C) Kong Inc.
 local timestamp = require "kong.tools.timestamp"
 local policies = require "kong.plugins.rate-limiting.policies"
+local kong_meta = require "kong.meta"
 
 
 local kong = kong
@@ -46,8 +47,8 @@ local X_RATELIMIT_REMAINING = {
 local RateLimitingHandler = {}
 
 
-RateLimitingHandler.PRIORITY = 901
-RateLimitingHandler.VERSION = "2.2.0"
+RateLimitingHandler.VERSION = kong_meta.version
+RateLimitingHandler.PRIORITY = 910
 
 
 local function get_identifier(conf)
@@ -67,6 +68,12 @@ local function get_identifier(conf)
 
   elseif conf.limit_by == "header" then
     identifier = kong.request.get_header(conf.header_name)
+
+  elseif conf.limit_by == "path" then
+    local req_path = kong.request.get_path()
+    if req_path == conf.path then
+      identifier = req_path
+    end
   end
 
   return identifier or kong.client.get_forwarded_ip()
@@ -139,8 +146,9 @@ function RateLimitingHandler:access(conf)
   if usage then
     -- Adding headers
     local reset
+    local headers
     if not conf.hide_client_headers then
-      local headers = {}
+      headers = {}
       local timestamps
       local limit
       local window
@@ -176,38 +184,23 @@ function RateLimitingHandler:access(conf)
       headers[RATELIMIT_LIMIT] = limit
       headers[RATELIMIT_REMAINING] = remaining
       headers[RATELIMIT_RESET] = reset
-
-      kong.ctx.plugin.headers = headers
     end
 
     -- If limit is exceeded, terminate the request
     if stop then
-      return kong.response.error(429, "API rate limit exceeded", {
-        [RETRY_AFTER] = reset
-      })
+      headers = headers or {}
+      headers[RETRY_AFTER] = reset
+      return kong.response.error(429, "API rate limit exceeded", headers)
+    end
+
+    if headers then
+      kong.response.set_headers(headers)
     end
   end
 
-  kong.ctx.plugin.timer = function()
-    local ok, err = timer_at(0, increment, conf, limits, identifier, current_timestamp, 1)
-    if not ok then
-      kong.log.err("failed to create timer: ", err)
-    end
-  end
-end
-
-
-function RateLimitingHandler:header_filter(_)
-  local headers = kong.ctx.plugin.headers
-  if headers then
-    kong.response.set_headers(headers)
-  end
-end
-
-
-function RateLimitingHandler:log(_)
-  if kong.ctx.plugin.timer then
-    kong.ctx.plugin.timer()
+  local ok, err = timer_at(0, increment, conf, limits, identifier, current_timestamp, 1)
+  if not ok then
+    kong.log.err("failed to create timer: ", err)
   end
 end
 

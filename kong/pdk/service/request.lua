@@ -1,5 +1,5 @@
 ---
--- Manipulation of the request to the Service
+-- Module for manipulating the request sent to the Service.
 -- @module kong.service.request
 
 local cjson = require "cjson.safe"
@@ -8,17 +8,21 @@ local phase_checker = require "kong.pdk.private.phases"
 
 
 local ngx = ngx
+local ngx_var = ngx.var
 local table_insert = table.insert
 local table_sort = table.sort
 local table_concat = table.concat
+local type = type
 local string_find = string.find
 local string_sub = string.sub
+local string_byte = string.byte
 local string_lower = string.lower
 local normalize_header = checks.normalize_header
 local normalize_multi_header = checks.normalize_multi_header
 local validate_header = checks.validate_header
 local validate_headers = checks.validate_headers
 local check_phase = phase_checker.check
+local escape = require("kong.tools.uri").escape
 
 
 local PHASES = phase_checker.phases
@@ -26,12 +30,13 @@ local PHASES = phase_checker.phases
 
 local access_and_rewrite = phase_checker.new(PHASES.rewrite, PHASES.access)
 local preread_and_balancer = phase_checker.new(PHASES.preread, PHASES.balancer)
+local access_rewrite_balancer = phase_checker.new(PHASES.rewrite, PHASES.access, PHASES.balancer)
 
 
 ---
 -- Produce a lexicographically ordered querystring, given a table of values.
 --
--- @param args A table where keys are strings and values are strings, booleans,
+-- @tparam table args A table where keys are strings and values are strings, booleans,
 -- or an array of strings or booleans.
 -- @treturn string|nil an URL-encoded query string, or nil if an error ocurred
 -- @treturn string|nil and an error message if an error ocurred, or nil
@@ -72,13 +77,14 @@ local function new(self)
   local CONTENT_TYPE_JSON      = "application/json"
   local CONTENT_TYPE_FORM_DATA = "multipart/form-data"
 
+  local SLASH                  = string_byte("/")
 
   ---
-  -- Enables buffered proxying that allows plugins to access service body and
-  -- response headers at the same time
+  -- Enables buffered proxying, which allows plugins to access Service body and
+  -- response headers at the same time.
   -- @function kong.service.request.enable_buffering
   -- @phases `rewrite`, `access`
-  -- @return Nothing
+  -- @return Nothing.
   -- @usage
   -- kong.service.request.enable_buffering()
   request.enable_buffering = function()
@@ -90,14 +96,14 @@ local function new(self)
     end
 
 
-    self.ctx.core.buffered_proxying = true
+    ngx.ctx.buffered_proxying = true
   end
 
   ---
   -- Sets the protocol to use when proxying the request to the Service.
   -- @function kong.service.request.set_scheme
   -- @phases `access`
-  -- @tparam string scheme The scheme to be used. Supported values are `"http"` or `"https"`
+  -- @tparam string scheme The scheme to be used. Supported values are `"http"` or `"https"`.
   -- @return Nothing; throws an error on invalid inputs.
   -- @usage
   -- kong.service.request.set_scheme("https")
@@ -112,16 +118,22 @@ local function new(self)
       error("invalid scheme: " .. scheme, 2)
     end
 
-    ngx.var.upstream_scheme = scheme
+    ngx_var.upstream_scheme = scheme
   end
 
 
   ---
-  -- Sets the path component for the request to the service. It is not
-  -- normalized in any way and should **not** include the querystring.
+  -- Sets the path component for the request to the service.
+  --
+  -- The input accepts any valid *normalized* URI (including UTF-8 characters)
+  -- and this API will perform necessary escaping according to the RFC
+  -- to make the request valid.
+  --
+  -- Input should **not** include the query string.
   -- @function kong.service.request.set_path
   -- @phases `access`
-  -- @param path The path string. Example: "/v2/movies"
+  -- @tparam string path The path string. Special characters and UTF-8
+  -- characters are allowed, for example: `"/v2/movies"` or `"/foo/😀"`.
   -- @return Nothing; throws an error on invalid inputs.
   -- @usage
   -- kong.service.request.set_path("/v2/movies")
@@ -132,26 +144,25 @@ local function new(self)
       error("path must be a string", 2)
     end
 
-    if string_sub(path, 1, 1) ~= "/" then
+    if string_byte(path) ~= SLASH then
       error("path must start with /", 2)
     end
 
-    -- TODO: is this necessary in specific phases?
-    -- ngx.req.set_uri(path)
-    ngx.var.upstream_uri = path
+    ngx_var.upstream_uri = escape(path)
   end
 
 
   ---
-  -- Sets the querystring of the request to the Service. The `query` argument is a
-  -- string (without the leading `?` character), and will not be processed in any
+  -- Sets the query string of the request to the Service. The `query` argument is a
+  -- string (without the leading `?` character), and is not processed in any
   -- way.
   --
   -- For a higher-level function to set the query string from a Lua table of
   -- arguments, see `kong.service.request.set_query()`.
   -- @function kong.service.request.set_raw_query
   -- @phases `rewrite`, `access`
-  -- @tparam string query The raw querystring. Example: "foo=bar&bla&baz=hello%20world"
+  -- @tparam string query The raw querystring. Example:
+  -- `"foo=bar&bla&baz=hello%20world"`.
   -- @return Nothing; throws an error on invalid inputs.
   -- @usage
   -- kong.service.request.set_raw_query("zzz&bar=baz&bar=bla&bar&blo=&foo=hello%20world")
@@ -191,10 +202,10 @@ local function new(self)
     --
     -- @function kong.service.request.set_method
     -- @phases `rewrite`, `access`
-    -- @param method The method string, which should be given in all
+    -- @tparam string method The method string, which must be in all
     -- uppercase. Supported values are: `"GET"`, `"HEAD"`, `"PUT"`, `"POST"`,
     -- `"DELETE"`, `"OPTIONS"`, `"MKCOL"`, `"COPY"`, `"MOVE"`, `"PROPFIND"`,
-    -- `"PROPPATCH"`, `"LOCK"`, `"UNLOCK"`, `"PATCH"`, `"TRACE"`.
+    -- `"PROPPATCH"`, `"LOCK"`, `"UNLOCK"`, `"PATCH"`, or `"TRACE"`.
     -- @return Nothing; throws an error on invalid inputs.
     -- @usage
     -- kong.service.request.set_method("DELETE")
@@ -216,24 +227,24 @@ local function new(self)
 
 
   ---
-  -- Set the querystring of the request to the Service.
+  -- Set the query string of the request to the Service.
   --
   -- Unlike `kong.service.request.set_raw_query()`, the `query` argument must be a
-  -- table in which each key is a string (corresponding to an arguments name), and
-  -- each value is either a boolean, a string or an array of strings or booleans.
+  -- table in which each key is a string (corresponding to an argument's name), and
+  -- each value is either a boolean, a string, or an array of strings or booleans.
   -- Additionally, all string values will be URL-encoded.
   --
-  -- The resulting querystring will contain keys in their lexicographical order. The
+  -- The resulting query string contains keys in their lexicographical order. The
   -- order of entries within the same key (when values are given as an array) is
   -- retained.
   --
-  -- If further control of the querystring generation is needed, a raw querystring
-  -- can be given as a string with `kong.service.request.set_raw_query()`.
+  -- If further control of the query string generation is needed, a raw query
+  -- string can be given as a string with `kong.service.request.set_raw_query()`.
   --
   -- @function kong.service.request.set_query
   -- @phases `rewrite`, `access`
   -- @tparam table args A table where each key is a string (corresponding to an
-  --   argument name), and each value is either a boolean, a string or an array of
+  --   argument name), and each value is either a boolean, a string, or an array of
   --   strings or booleans. Any string values given are URL-encoded.
   -- @return Nothing; throws an error on invalid inputs.
   -- @usage
@@ -243,7 +254,7 @@ local function new(self)
   --   zzz = true,
   --   blo = ""
   -- })
-  -- -- Will produce the following query string:
+  -- -- Produces the following query string:
   -- -- bar=baz&bar=bla&bar&blo=&foo=hello%20world&zzz
   request.set_query = function(args)
     check_phase(access_and_rewrite)
@@ -261,27 +272,43 @@ local function new(self)
   end
 
 
+  local set_authority
+  if ngx.config.subsystem ~= "stream" then
+    set_authority = require("resty.kong.grpc").set_authority
+  end
+
   ---
   -- Sets a header in the request to the Service with the given value. Any existing header
   -- with the same name will be overridden.
   --
-  -- If the `header` argument is `"host"` (case-insensitive), then this is
-  -- will also set the SNI of the request to the Service.
+  -- If the `header` argument is `"host"` (case-insensitive), then this also
+  -- sets the SNI of the request to the Service.
   --
   -- @function kong.service.request.set_header
-  -- @phases `rewrite`, `access`
-  -- @tparam string header The header name. Example: "X-Foo"
-  -- @tparam string|boolean|number value The header value. Example: "hello world"
+  -- @phases `rewrite`, `access`, `balancer`
+  -- @tparam string header The header name. Example: "X-Foo".
+  -- @tparam string|boolean|number value The header value. Example: "hello world".
   -- @return Nothing; throws an error on invalid inputs.
   -- @usage
   -- kong.service.request.set_header("X-Foo", "value")
   request.set_header = function(header, value)
-    check_phase(access_and_rewrite)
+    check_phase(access_rewrite_balancer)
 
     validate_header(header, value)
 
     if string_lower(header) == "host" then
-      ngx.var.upstream_host = value
+      ngx_var.upstream_host = value
+    end
+
+    if string_lower(header) == ":authority" then
+      if ngx_var.upstream_scheme == "grpc" or
+         ngx_var.upstream_scheme == "grpcs"
+      then
+        return set_authority(value)
+
+      else
+        return nil, "cannot set :authority pseudo-header on non-grpc requests"
+      end
     end
 
     ngx.req.set_header(header, normalize_header(value))
@@ -289,14 +316,14 @@ local function new(self)
 
   ---
   -- Adds a request header with the given value to the request to the Service. Unlike
-  -- `kong.service.request.set_header()`, this function will not remove any existing
-  -- headers with the same name. Instead, several occurences of the header will be
+  -- `kong.service.request.set_header()`, this function doesn't remove any existing
+  -- headers with the same name. Instead, several occurrences of the header will be
   -- present in the request. The order in which headers are added is retained.
   --
   -- @function kong.service.request.add_header
   -- @phases `rewrite`, `access`
-  -- @tparam string header The header name. Example: "Cache-Control"
-  -- @tparam string|number|boolean value The header value. Example: "no-cache"
+  -- @tparam string header The header name. Example: "Cache-Control".
+  -- @tparam string|number|boolean value The header value. Example: "no-cache".
   -- @return Nothing; throws an error on invalid inputs.
   -- @usage
   -- kong.service.request.add_header("Cache-Control", "no-cache")
@@ -307,7 +334,7 @@ local function new(self)
     validate_header(header, value)
 
     if string_lower(header) == "host" then
-      ngx.var.upstream_host = value
+      ngx_var.upstream_host = value
     end
 
     local headers = ngx.req.get_headers()[header]
@@ -322,10 +349,10 @@ local function new(self)
 
 
   ---
-  -- Removes all occurrences of the specified header in the request to the Service.
+  -- Removes all occurrences of the specified header from the request to the Service.
   -- @function kong.service.request.clear_header
   -- @phases `rewrite`, `access`
-  -- @tparam string header The header name. Example: "X-Foo"
+  -- @tparam string header The header name. Example: "X-Foo".
   -- @return Nothing; throws an error on invalid inputs.
   --   The function does not throw an error if no header was removed.
   -- @usage
@@ -356,8 +383,8 @@ local function new(self)
   -- This function overrides any existing header bearing the same name as those
   -- specified in the `headers` argument. Other headers remain unchanged.
   --
-  -- If the `"Host"` header is set (case-insensitive), then this is
-  -- will also set the SNI of the request to the Service.
+  -- If the `"Host"` header is set (case-insensitive), then this also sets
+  -- the SNI of the request to the Service.
   -- @function kong.service.request.set_headers
   -- @phases `rewrite`, `access`
   -- @tparam table headers A table where each key is a string containing a header name
@@ -394,7 +421,7 @@ local function new(self)
 
     for k, v in pairs(headers) do
       if string_lower(k) == "host" then
-        ngx.var.upstream_host = v
+        ngx_var.upstream_host = v
       end
 
       ngx.req.set_header(k, normalize_multi_header(v))
@@ -408,13 +435,13 @@ local function new(self)
   --
   -- The `body` argument must be a string and will not be processed in any way.
   -- This function also sets the `Content-Length` header appropriately. To set an
-  -- empty body, one can give an empty string `""` to this function.
+  -- empty body, you can provide an empty string (`""`) to this function.
   --
   -- For a higher-level function to set the body based on the request content type,
   -- see `kong.service.request.set_body()`.
   -- @function kong.service.request.set_raw_body
   -- @phases `rewrite`, `access`
-  -- @tparam string body The raw body
+  -- @tparam string body The raw body.
   -- @return Nothing; throws an error on invalid inputs.
   -- @usage
   -- kong.service.request.set_raw_body("Hello, world!")
@@ -439,6 +466,8 @@ local function new(self)
 
 
   do
+    local QUOTE = string_byte('"')
+
     local set_body_handlers = {
 
       [CONTENT_TYPE_POST] = function(args, mime)
@@ -471,7 +500,7 @@ local function new(self)
         local at = string_find(mime, "boundary=", 1, true)
         if at then
           at = at + 9
-          if string_sub(mime, at, at) == '"' then
+          if string_byte(mime, at) == QUOTE then
             local till = string_find(mime, '"', at + 1, true)
             boundary = string_sub(mime, at + 1, till - 1)
           else
@@ -503,7 +532,7 @@ local function new(self)
             end
             keys[i] = k
             i = i + 1
-            if string_find(v, boundary_check, 1, true) then
+            if string_find(tostring(v), boundary_check, 1, true) then
               boundary_ok = false
             end
           end
@@ -542,36 +571,26 @@ local function new(self)
     ---
     -- Sets the body of the request to the Service. Unlike
     -- `kong.service.request.set_raw_body()`, the `args` argument must be a table, and
-    -- will be encoded with a MIME type.  The encoding MIME type can be specified in
-    -- the optional `mimetype` argument, or if left unspecified, will be chosen based
+    -- is encoded with a MIME type.  The encoding MIME type can be specified in
+    -- the optional `mimetype` argument, or if left unspecified, is chosen based
     -- on the `Content-Type` header of the client's request.
     --
-    -- If the MIME type is `application/x-www-form-urlencoded`:
-    --
-    -- * Encodes the arguments as form-encoded: keys are produced in lexicographical
+    -- Behavior based on MIME type in the `Content-Type` header:
+    -- * `application/x-www-form-urlencoded`: Encodes the arguments as
+    --   form-encoded. Keys are produced in lexicographical
     --   order. The order of entries within the same key (when values are
     --   given as an array) is retained. Any string values given are URL-encoded.
     --
-    -- If the MIME type is `multipart/form-data`:
+    -- * `multipart/form-data`: Encodes the arguments as multipart form data.
     --
-    -- * Encodes the arguments as multipart form data.
+    -- * `application/json`: Encodes the arguments as JSON (same as
+    --   `kong.service.request.set_raw_body(json.encode(args))`). Lua types are
+    --   converted to matching JSON types.
     --
-    -- If the MIME type is `application/json`:
+    -- If the MIME type is none of the above, this function returns `nil` and
+    -- an error message indicating the body could not be encoded.
     --
-    -- * Encodes the arguments as JSON (same as
-    --   `kong.service.request.set_raw_body(json.encode(args))`)
-    -- * Lua types are converted to matching JSON types.mej
-    --
-    -- If none of the above, returns `nil` and an error message indicating the
-    -- body could not be encoded.
-    --
-    -- The optional argument `mimetype` can be one of:
-    --
-    -- * `application/x-www-form-urlencoded`
-    -- * `application/json`
-    -- * `multipart/form-data`
-    --
-    -- If the `mimetype` argument is specified, the `Content-Type` header will be
+    -- If the `mimetype` argument is specified, the `Content-Type` header is
     -- set accordingly in the request to the Service.
     --
     -- If further control of the body generation is needed, a raw body can be given as
@@ -582,7 +601,7 @@ local function new(self)
     -- @tparam table args A table with data to be converted to the appropriate format
     -- and stored in the body.
     -- @tparam[opt] string mimetype can be one of:
-    -- @treturn boolean|nil `true` on success, `nil` otherwise
+    -- @treturn boolean|nil `true` on success, `nil` otherwise.
     -- @treturn string|nil `nil` on success, an error message in case of error.
     -- Throws an error on invalid inputs.
     -- @usage
@@ -654,14 +673,14 @@ local function new(self)
 
     ---
     -- Disables the TLS handshake to upstream for [ngx\_stream\_proxy\_module](https://nginx.org/en/docs/stream/ngx_stream_proxy_module.html).
-    -- Effectively this overrides [proxy\_ssl](https://nginx.org/en/docs/stream/ngx_stream_proxy_module.html#proxy_ssl) directive to `off` setting
+    -- This overrides the [proxy\_ssl](https://nginx.org/en/docs/stream/ngx_stream_proxy_module.html#proxy_ssl) directive, effectively setting it to `off`
     -- for the current stream session.
     --
-    -- Note that once this function has been called it is not possible to re-enable TLS handshake for the current session.
+    -- Once this function has been called, it is not possible to re-enable TLS handshake for the current session.
     --
     -- @function kong.service.request.disable_tls
     -- @phases `preread`, `balancer`
-    -- @treturn boolean|nil `true` if the operation succeeded, `nil` if an error occurred
+    -- @treturn boolean|nil `true` if the operation succeeded, `nil` if an error occurred.
     -- @treturn string|nil An error message describing the error if there was one.
     -- @usage
     -- local ok, err = kong.service.request.disable_tls()

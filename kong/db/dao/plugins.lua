@@ -2,10 +2,10 @@ local constants = require "kong.constants"
 local utils = require "kong.tools.utils"
 local DAO = require "kong.db.dao"
 local plugin_loader = require "kong.db.schema.plugin_loader"
-local BasePlugin = require "kong.plugins.base_plugin"
-local go = require "kong.db.dao.plugins.go"
 local reports = require "kong.reports"
-
+local plugin_servers = require "kong.runloop.plugin_servers"
+local version = require "version"
+local sort_by_handler_priority = utils.sort_by_handler_priority
 
 local Plugins = {}
 
@@ -79,12 +79,6 @@ local function check_protocols_match(self, plugin)
   return true
 end
 
-
-local function sort_by_handler_priority(a, b)
-  return (a.handler.PRIORITY or 0) > (b.handler.PRIORITY or 0)
-end
-
-
 function Plugins:insert(entity, options)
   local ok, err, err_t = check_protocols_match(self, entity)
   if not ok then
@@ -116,48 +110,87 @@ function Plugins:upsert(primary_key, entity, options)
   return self.super.upsert(self, primary_key, entity, options)
 end
 
---- Given a set of plugin names, check if all plugins stored
--- in the database fall into this set.
--- @param plugin_set a set of plugin names.
--- @return true or nil and an error message.
-function Plugins:check_db_against_config(plugin_set)
-  local in_db_plugins = {}
-  ngx_log(ngx_DEBUG, "Discovering used plugins")
 
-  for row, err in self:each() do
-    if err then
-      return nil, tostring(err)
-    end
-    in_db_plugins[row.name] = true
+local function implements(plugin, method)
+  if type(plugin) ~= "table" then
+    return false
   end
 
-  -- check all plugins in DB are enabled/installed
-  for plugin in pairs(in_db_plugins) do
-    if not plugin_set[plugin] then
-      return nil, plugin .. " plugin is in use but not enabled"
-    end
-  end
-
-  return true
+  local m = plugin[method]
+  return type(m) == "function"
 end
 
 
-local function load_plugin_handler(plugin)
-  -- NOTE: no version _G.kong (nor PDK) in plugins main chunk
+local load_plugin_handler do
 
-  local plugin_handler = "kong.plugins." .. plugin .. ".handler"
-  local ok, handler = utils.load_module_if_exists(plugin_handler)
-  if not ok and go.is_on() then
-      ok, handler = go.load_plugin(plugin)
+  local function valid_priority(prio)
+    if type(prio) ~= "number" or
+       prio ~= prio or  -- NaN
+       math.abs(prio) == math.huge or
+       math.floor(prio) ~= prio then
+      return false
+    end
+    return true
+  end
+
+  -- Returns the cleaned version string, only x.y.z part
+  local function valid_version(v)
+    if type(v) ~= "string" then
+      return false
+    end
+    local vparsed = version(v)
+    if not vparsed or vparsed[4] ~= nil then
+      return false
+    end
+
+    return tostring(vparsed)
+  end
+
+
+  function load_plugin_handler(plugin)
+    -- NOTE: no version _G.kong (nor PDK) in plugins main chunk
+
+    local plugin_handler = "kong.plugins." .. plugin .. ".handler"
+    local ok, handler = utils.load_module_if_exists(plugin_handler)
+    if not ok then
+      ok, handler = plugin_servers.load_plugin(plugin)
       if type(handler) == "table" then
         handler._go = true
       end
-  end
-  if not ok then
-    return nil, plugin .. " plugin is enabled but not installed;\n" .. handler
-  end
+    end
 
-  return handler
+    if not ok then
+      return nil, plugin .. " plugin is enabled but not installed;\n" .. handler
+    end
+
+    if type(handler) == "table" then
+
+      if not valid_priority(handler.PRIORITY) then
+        return nil, fmt(
+          "Plugin %q cannot be loaded because its PRIORITY field is not " ..
+          "a valid integer number, got: %q.\n", plugin, tostring(handler.PRIORITY))
+      end
+
+      local v = valid_version(handler.VERSION)
+      if v then
+        handler.VERSION = v -- update to cleaned version string
+      else
+        return nil, fmt(
+          "Plugin %q cannot be loaded because its VERSION field does not " ..
+          "follow the \"x.y.z\" format, got: %q.\n", plugin, tostring(handler.VERSION))
+      end
+    end
+
+    if implements(handler, "response") and
+        (implements(handler, "header_filter") or implements(handler, "body_filter"))
+    then
+      return nil, fmt(
+        "Plugin %q can't be loaded because it implements both `response` " ..
+        "and `header_filter` or `body_filter` methods.\n", plugin)
+    end
+
+    return handler
+  end
 end
 
 
@@ -234,14 +267,18 @@ local function load_plugin(self, plugin)
     return nil, err
   end
 
-  if schema.fields.consumer and schema.fields.consumer.eq == null then
-    plugin.no_consumer = true
-  end
-  if schema.fields.route and schema.fields.route.eq == null then
-    plugin.no_route = true
-  end
-  if schema.fields.service and schema.fields.service.eq == null then
-    plugin.no_service = true
+  for _, field in ipairs(schema.fields) do
+    if field.consumer and field.consumer.eq == null then
+      handler.no_consumer = true
+    end
+
+    if field.route and field.route.eq == null then
+      handler.no_route = true
+    end
+
+    if field.service and field.service.eq == null then
+      handler.no_service = true
+    end
   end
 
   ngx_log(ngx_DEBUG, "Loading plugin: ", plugin)
@@ -275,13 +312,6 @@ function Plugins:load_plugin_schemas(plugin_set)
     local handler, err = load_plugin(self, plugin)
 
     if handler then
-      if type(handler.is) == "function" and handler:is(BasePlugin) then
-        -- Backwards-compatibility for 0.x and 1.x plugins inheriting from the
-        -- BasePlugin class.
-        -- TODO: deprecate & remove
-        handler = handler()
-      end
-
       if handler._go then
         go_plugins_cnt = go_plugins_cnt + 1
       end
@@ -323,41 +353,6 @@ function Plugins:get_handlers()
   table.sort(list, sort_by_handler_priority)
 
   return list
-end
-
-
-function Plugins:select_by_cache_key(key)
-
-  -- first try new way
-  local entity, new_err = self.super.select_by_cache_key(self, key)
-
-  if not new_err then -- the step above didn't fail
-    -- we still need to check whether the migration is done,
-    -- because the new table may be only partially full
-    local schema_state = assert(self.db:schema_state())
-
-    -- if migration is complete, disable this translator function and return
-    if schema_state:is_migration_executed("core", "009_200_to_210") then
-      Plugins.select_by_cache_key = self.super.select_by_cache_key
-      return entity
-    end
-  end
-
-  key = key:sub(1, -38) -- strip ":<ws_id>" from the end
-
-  -- otherwise, we either have not started migrating, or we're migrating but
-  -- the plugin identified by key doesn't have a cache_key yet
-  -- do things "the old way" in both cases
-  local row, old_err = self.super.select_by_cache_key(self, key)
-  if row then
-    return self:row_to_entity(row)
-  end
-
-  -- when both ways have failed, return the "new" error message.
-  -- otherwise, only return an error if the "old" version failed.
-  local err = (new_err and old_err) and new_err or old_err
-
-  return nil, err
 end
 
 

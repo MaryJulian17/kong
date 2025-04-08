@@ -10,15 +10,8 @@ return {
         fields = {
           { allow = { type = "array", elements = typedefs.ip_or_cidr, }, },
           { deny = { type = "array", elements = typedefs.ip_or_cidr, }, },
-        },
-        shorthands = {
-          -- deprecated forms, to be removed in Kong 3.0
-          { blacklist = function(value)
-              return { deny = value }
-            end },
-          { whitelist = function(value)
-              return { allow = value }
-            end },
+          { status = { type = "number", required = false } },
+          { message = { type = "string", required = false } },
         },
       },
     },

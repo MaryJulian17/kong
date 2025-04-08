@@ -1,4 +1,6 @@
 local cjson = require "cjson"
+local sandbox = require "kong.tools.sandbox".sandbox
+local kong_meta = require "kong.meta"
 
 
 local kong = kong
@@ -9,6 +11,9 @@ local timer_at = ngx.timer.at
 local udp = ngx.socket.udp
 local concat = table.concat
 local insert = table.insert
+
+
+local sandbox_opts = { env = { kong = kong, ngx = ngx } }
 
 
 local function get_host_name()
@@ -94,17 +99,25 @@ local function decide_severity(conf, severity, message)
   return send_to_loggly(conf, message, pri)
 end
 
+local is_html = nil
+
 local function log(premature, conf, message)
   if premature then
     return
   end
 
-  if message.response.status >= 500 then
-    return decide_severity(conf, conf.server_errors_severity, message)
+  if is_html == nil then
+    is_html = ngx.config.subsystem == "http"
   end
 
-  if message.response.status >= 400 then
-    return decide_severity(conf, conf.client_errors_severity, message)
+  if is_html then
+    if message.response.status >= 500 then
+      return decide_severity(conf, conf.server_errors_severity, message)
+    end
+
+    if message.response.status >= 400 then
+      return decide_severity(conf, conf.client_errors_severity, message)
+    end
   end
 
   return decide_severity(conf, conf.successful_severity, message)
@@ -113,11 +126,18 @@ end
 
 local LogglyLogHandler = {
   PRIORITY = 6,
-  VERSION = "2.0.1",
+  VERSION = kong_meta.version,
 }
 
 
 function LogglyLogHandler:log(conf)
+  if conf.custom_fields_by_lua then
+    local set_serialize_value = kong.log.set_serialize_value
+    for key, expression in pairs(conf.custom_fields_by_lua) do
+      set_serialize_value(key, sandbox(expression, sandbox_opts)())
+    end
+  end
+
   local message = kong.log.serialize()
 
   local ok, err = timer_at(0, log, conf, message)

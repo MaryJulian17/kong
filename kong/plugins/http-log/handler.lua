@@ -2,6 +2,9 @@ local BatchQueue = require "kong.tools.batch_queue"
 local cjson = require "cjson"
 local url = require "socket.url"
 local http = require "resty.http"
+local table_clear = require "table.clear"
+local sandbox = require "kong.tools.sandbox".sandbox
+local kong_meta = require "kong.meta"
 
 
 local kong = kong
@@ -11,10 +14,19 @@ local tostring = tostring
 local tonumber = tonumber
 local concat = table.concat
 local fmt = string.format
+local pairs = pairs
+
+
+local sandbox_opts = { env = { kong = kong, ngx = ngx } }
 
 
 local queues = {} -- one queue per unique plugin config
 local parsed_urls_cache = {}
+local headers_cache = {}
+local params_cache = {
+  ssl_verify = false,
+  headers = headers_cache,
+}
 
 
 -- Parse host url.
@@ -56,46 +68,42 @@ local function send_payload(self, conf, payload)
   local content_type = conf.content_type
   local http_endpoint = conf.http_endpoint
 
-  local ok, err
   local parsed_url = parse_url(http_endpoint)
   local host = parsed_url.host
   local port = tonumber(parsed_url.port)
 
   local httpc = http.new()
   httpc:set_timeout(timeout)
-  ok, err = httpc:connect(host, port)
-  if not ok then
-    return nil, "failed to connect to " .. host .. ":" .. tostring(port) .. ": " .. err
-  end
 
-  if parsed_url.scheme == "https" then
-    local _, err = httpc:ssl_handshake(true, host, false)
-    if err then
-      return nil, "failed to do SSL handshake with " ..
-                  host .. ":" .. tostring(port) .. ": " .. err
+  table_clear(headers_cache)
+  if conf.headers then
+    for h, v in pairs(conf.headers) do
+      headers_cache[h] = v
     end
   end
 
-  local res, err = httpc:request({
-    method = method,
-    path = parsed_url.path,
-    query = parsed_url.query,
-    headers = {
-      ["Host"] = parsed_url.host,
-      ["Content-Type"] = content_type,
-      ["Content-Length"] = #payload,
-      ["Authorization"] = parsed_url.userinfo and (
-        "Basic " .. encode_base64(parsed_url.userinfo)
-      ),
-    },
-    body = payload,
-  })
+  headers_cache["Host"] = parsed_url.host
+  headers_cache["Content-Type"] = content_type
+  headers_cache["Content-Length"] = #payload
+  if parsed_url.userinfo then
+    headers_cache["Authorization"] = "Basic " .. encode_base64(parsed_url.userinfo)
+  end
+
+  params_cache.method = method
+  params_cache.body = payload
+  params_cache.keepalive_timeout = keepalive
+
+  local url = fmt("%s://%s:%d%s", parsed_url.scheme, parsed_url.host, parsed_url.port, parsed_url.path)
+
+  -- note: `httpc:request` makes a deep copy of `params_cache`, so it will be
+  -- fine to reuse the table here
+  local res, err = httpc:request_uri(url, params_cache)
   if not res then
     return nil, "failed request to " .. host .. ":" .. tostring(port) .. ": " .. err
   end
 
   -- always read response body, even if we discard it without using it on success
-  local response_body = res:read_body()
+  local response_body = res.body
   local success = res.status < 400
   local err_msg
 
@@ -103,13 +111,6 @@ local function send_payload(self, conf, payload)
     err_msg = "request to " .. host .. ":" .. tostring(port) ..
               " returned status code " .. tostring(res.status) .. " and body " ..
               response_body
-  end
-
-  ok, err = httpc:set_keepalive(keepalive)
-  if not ok then
-    -- the batch might already be processed at this point, so not being able to set the keepalive
-    -- will not return false (the batch might not need to be reprocessed)
-    kong.log.err("failed keepalive for ", host, ":", tostring(port), ": ", err)
   end
 
   return success, err_msg
@@ -136,11 +137,18 @@ end
 
 local HttpLogHandler = {
   PRIORITY = 12,
-  VERSION = "2.0.1",
+  VERSION = kong_meta.version,
 }
 
 
 function HttpLogHandler:log(conf)
+  if conf.custom_fields_by_lua then
+    local set_serialize_value = kong.log.set_serialize_value
+    for key, expression in pairs(conf.custom_fields_by_lua) do
+      set_serialize_value(key, sandbox(expression, sandbox_opts)())
+    end
+  end
+
   local entry = cjson.encode(kong.log.serialize())
 
   local queue_id = get_queue_id(conf)
@@ -163,7 +171,7 @@ function HttpLogHandler:log(conf)
     }
 
     local err
-    q, err = BatchQueue.new(process, opts)
+    q, err = BatchQueue.new("http-log", process, opts)
     if not q then
       kong.log.err("could not create queue: ", err)
       return

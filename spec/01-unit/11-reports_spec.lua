@@ -14,8 +14,8 @@ describe("reports", function()
       package.loaded["kong.reports"] = nil
     end)
 
-    it("sends report over TCP", function()
-      local thread = helpers.tcp_server(8189)
+    it("sends report over TCP[TLS]", function()
+      local thread = helpers.tcp_server(8189, {tls=true})
 
       reports.send("stub", {
         hello = "world",
@@ -60,7 +60,7 @@ describe("reports", function()
     it("accepts custom immutable items", function()
       reports.toggle(true)
 
-      local thread = helpers.tcp_server(8189)
+      local thread = helpers.tcp_server(8189, {tls=true})
 
       reports.add_immutable_value("imm1", "fooval")
       reports.add_immutable_value("imm2", "barval")
@@ -85,6 +85,21 @@ describe("reports", function()
       reports._create_counter()
     end)
 
+    describe("sends 'cluster_id'", function()
+      it("uses mock value 123e4567-e89b-12d3-a456-426655440000", function()
+        local conf = assert(conf_loader(nil, {
+          database = "postgres",
+        }))
+        reports.configure_ping(conf)
+
+        local thread = helpers.tcp_server(8189, {tls=true})
+        reports.send_ping("127.0.0.1", 8189)
+
+        local _, res = assert(thread:join())
+        assert._matches("cluster_id=123e4567-e89b-12d3-a456-426655440000", res, nil, true)
+      end)
+    end)
+
     describe("sends 'database'", function()
       it("postgres", function()
         local conf = assert(conf_loader(nil, {
@@ -92,7 +107,7 @@ describe("reports", function()
         }))
         reports.configure_ping(conf)
 
-        local thread = helpers.tcp_server(8189)
+        local thread = helpers.tcp_server(8189, {tls=true})
         reports.send_ping("127.0.0.1", 8189)
 
         local _, res = assert(thread:join())
@@ -105,7 +120,7 @@ describe("reports", function()
         }))
         reports.configure_ping(conf)
 
-        local thread = helpers.tcp_server(8189)
+        local thread = helpers.tcp_server(8189, {tls=true})
         reports.send_ping("127.0.0.1", 8189)
 
         local _, res = assert(thread:join())
@@ -118,7 +133,7 @@ describe("reports", function()
         }))
         reports.configure_ping(conf)
 
-        local thread = helpers.tcp_server(8189)
+        local thread = helpers.tcp_server(8189, {tls=true})
         reports.send_ping("127.0.0.1", 8189)
 
         local _, res = assert(thread:join())
@@ -131,7 +146,7 @@ describe("reports", function()
         local conf = assert(conf_loader(nil))
         reports.configure_ping(conf)
 
-        local thread = helpers.tcp_server(8189)
+        local thread = helpers.tcp_server(8189, {tls=true})
         reports.send_ping("127.0.0.1", 8189)
 
         local _, res = assert(thread:join())
@@ -146,7 +161,7 @@ describe("reports", function()
         }))
         reports.configure_ping(conf)
 
-        local thread = helpers.tcp_server(8189)
+        local thread = helpers.tcp_server(8189, {tls=true})
         reports.send_ping("127.0.0.1", 8189)
 
         local _, res = assert(thread:join())
@@ -162,7 +177,7 @@ describe("reports", function()
         }))
         reports.configure_ping(conf)
 
-        local thread = helpers.tcp_server(8189)
+        local thread = helpers.tcp_server(8189, {tls=true})
         reports.send_ping("127.0.0.1", 8189)
 
         local _, res = assert(thread:join())
@@ -175,7 +190,7 @@ describe("reports", function()
         local conf = assert(conf_loader(nil))
         reports.configure_ping(conf)
 
-        local thread = helpers.tcp_server(8189)
+        local thread = helpers.tcp_server(8189, {tls=true})
         reports.send_ping("127.0.0.1", 8189)
 
         local _, res = assert(thread:join())
@@ -188,7 +203,7 @@ describe("reports", function()
         }))
         reports.configure_ping(conf)
 
-        local thread = helpers.tcp_server(8189)
+        local thread = helpers.tcp_server(8189, {tls=true})
         reports.send_ping("127.0.0.1", 8189)
 
         local _, res = assert(thread:join())
@@ -203,7 +218,7 @@ describe("reports", function()
         }))
         reports.configure_ping(conf)
 
-        local thread = helpers.tcp_server(8189)
+        local thread = helpers.tcp_server(8189, {tls=true})
         reports.send_ping("127.0.0.1", 8189)
 
         local _, res = assert(thread:join())
@@ -216,7 +231,7 @@ describe("reports", function()
         }))
         reports.configure_ping(conf)
 
-        local thread = helpers.tcp_server(8189)
+        local thread = helpers.tcp_server(8189, {tls=true})
         reports.send_ping("127.0.0.1", 8189)
 
         local _, res = assert(thread:join())
@@ -231,7 +246,7 @@ describe("reports", function()
         }))
         reports.configure_ping(conf)
 
-        local thread = helpers.tcp_server(8189)
+        local thread = helpers.tcp_server(8189, {tls=true})
         reports.send_ping("127.0.0.1", 8189)
 
         local _, res = assert(thread:join())
@@ -244,7 +259,7 @@ describe("reports", function()
         }))
         reports.configure_ping(conf)
 
-        local thread = helpers.tcp_server(8189)
+        local thread = helpers.tcp_server(8189, {tls=true})
         reports.send_ping("127.0.0.1", 8189)
 
         local _, res = assert(thread:join())
@@ -259,7 +274,7 @@ describe("reports", function()
         }))
         reports.configure_ping(conf)
 
-        local thread = helpers.tcp_server(8189)
+        local thread = helpers.tcp_server(8189, {tls=true})
         reports.send_ping("127.0.0.1", 8189)
 
         local _, res = assert(thread:join())
@@ -272,7 +287,7 @@ describe("reports", function()
         }))
         reports.configure_ping(conf)
 
-        local thread = helpers.tcp_server(8189)
+        local thread = helpers.tcp_server(8189, {tls=true})
         reports.send_ping("127.0.0.1", 8189)
 
         local _, res = assert(thread:join())
@@ -284,7 +299,7 @@ describe("reports", function()
         local conf = assert(conf_loader())
         reports.configure_ping(conf)
 
-        local thread = helpers.tcp_server(8189)
+        local thread = helpers.tcp_server(8189, {tls=true})
         reports.send_ping("127.0.0.1", 8189)
 
         local _, res = assert(thread:join())

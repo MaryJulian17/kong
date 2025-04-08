@@ -100,7 +100,8 @@ for _, strategy in helpers.each_strategy() do
                                     .. ":"
                                     .. helpers.mock_upstream_port
                                     .. "/post_auth_log/basic_auth"
-                                    .. "/testuser/testpassword"
+                                    .. "/testuser/testpassword",
+          headers = { ["Hello-World"] = "hi there" },
         }
       }
 
@@ -139,12 +140,11 @@ for _, strategy in helpers.each_strategy() do
         }
       }
 
-      local test_error_log_path = helpers.test_conf.nginx_err_logs
-      os.execute(":> " .. test_error_log_path)
+      helpers.clean_logfile()
 
       local grpc_service = assert(bp.services:insert {
         name = "grpc-service",
-        url = "grpc://localhost:15002",
+        url = helpers.grpcbin_url,
       })
 
       local route7 = assert(bp.routes:insert {
@@ -167,7 +167,7 @@ for _, strategy in helpers.each_strategy() do
 
       local grpcs_service = assert(bp.services:insert {
         name = "grpcs-service",
-        url = "grpcs://localhost:15003",
+        url = helpers.grpcbin_ssl_url,
       })
 
       local route8 = assert(bp.routes:insert {
@@ -186,6 +186,32 @@ for _, strategy in helpers.each_strategy() do
                                     .. "/post_log/grpcs",
           timeout = 1
         },
+      }
+
+      local service9 = bp.services:insert{
+        protocol = "http",
+        host     = helpers.mock_upstream_host,
+        port     = helpers.mock_upstream_port,
+      }
+
+      local route9 = bp.routes:insert {
+        hosts   = { "custom_http_logging.test" },
+        service = service9
+      }
+
+      bp.plugins:insert {
+        route = { id = route9.id },
+        name     = "http-log",
+        config   = {
+          http_endpoint = "http://" .. helpers.mock_upstream_host
+                                    .. ":"
+                                    .. helpers.mock_upstream_port
+                                    .. "/post_log/custom_http",
+          custom_fields_by_lua = {
+            new_field = "return 123",
+            route = "return nil", -- unset route field
+          },
+        }
       }
 
       assert(helpers.start_kong({
@@ -239,6 +265,39 @@ for _, strategy in helpers.each_strategy() do
           return true
         end
       end, 10)
+    end)
+
+    describe("custom log values by lua", function()
+      it("logs custom values", function()
+        local res = assert(proxy_client:send({
+          method = "GET",
+          path = "/status/200",
+          headers = {
+            ["Host"] = "custom_http_logging.test"
+          }
+        }))
+        assert.res_status(200, res)
+
+        helpers.wait_until(function()
+          local client = assert(helpers.http_client(helpers.mock_upstream_host,
+          helpers.mock_upstream_port))
+          local res = assert(client:send {
+            method  = "GET",
+            path    = "/read_log/custom_http",
+            headers = {
+              Accept = "application/json"
+            }
+          })
+          local raw = assert.res_status(200, res)
+          local body = cjson.decode(raw)
+
+          if #body.entries == 1 then
+            assert.same("127.0.0.1", body.entries[1].client_ip)
+            assert.same(123, body.entries[1].new_field)
+            return true
+          end
+        end, 10)
+      end)
     end)
 
     it("logs to HTTP (#grpc)", function()
@@ -344,8 +403,7 @@ for _, strategy in helpers.each_strategy() do
 
     it("gracefully handles layer 4 failures", function()
       -- setup: cleanup logs
-      local test_error_log_path = helpers.test_conf.nginx_err_logs
-      os.execute(":> " .. test_error_log_path)
+      os.execute(":> " .. helpers.test_conf.nginx_err_logs)
 
       local res = assert(proxy_client:send({
         method  = "GET",
@@ -355,35 +413,12 @@ for _, strategy in helpers.each_strategy() do
         }
       }))
       assert.res_status(200, res)
-
-      local pl_file = require "pl.file"
-
-      helpers.wait_until(function()
-        -- Assertion: there should be no [error] resulting from attempting
-        -- to reference a nil res on res:body() calls within the http-log plugin
-
-        local logs = pl_file.read(test_error_log_path)
-        local found = false
-
-        for line in logs:gmatch("[^\r\n]+") do
-          if line:find("failed to process entries: .* " ..
+      assert.logfile().has.line("failed to process entries: .* " ..
                        helpers.mock_upstream_ssl_host .. ":" ..
-                       helpers.mock_upstream_ssl_port .. ": timeout")
-          then
-            found = true
-
-          else
-            assert.not_match("[error]", line, nil, true)
-          end
-        end
-
-        if found then
-            return true
-        end
-      end, 2)
+                       helpers.mock_upstream_ssl_port .. ": timeout", false, 2)
     end)
 
-    it("adds authorization if userinfo is present", function()
+    it("adds authorization if userinfo and/or header is present", function()
       local res = assert(proxy_client:send({
         method  = "GET",
         path    = "/status/200",
@@ -407,11 +442,19 @@ for _, strategy in helpers.each_strategy() do
         local body = cjson.decode(assert.res_status(200, res))
 
         if #body.entries == 1 then
+          local ok = 0
           for name, value in pairs(body.entries[1].log_req_headers) do
             if name == "authorization" then
               assert.same("Basic dGVzdHVzZXI6dGVzdHBhc3N3b3Jk", value)
-              return true
+              ok = ok + 1
             end
+            if name == "hello-world" then
+              assert.equal("hi there", value)
+              ok = ok + 1
+            end
+          end
+          if ok == 2 then
+            return true
           end
         end
       end, 10)
@@ -728,13 +771,7 @@ for _, strategy in helpers.each_strategy() do
       -- Assertion: there should be no [error], including no error
       -- resulting from attempting to reference the id on
       -- a route when no such value exists after http-log execution
-
-      local pl_file = require "pl.file"
-      local logs = pl_file.read(helpers.test_conf.nginx_err_logs)
-
-      for line in logs:gmatch("[^\r\n]+") do
-        assert.not_match("[error]", line, nil, true)
-      end
+      assert.logfile().has.no.line("[error]", true)
     end)
   end)
 end

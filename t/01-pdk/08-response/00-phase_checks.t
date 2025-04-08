@@ -1,7 +1,7 @@
 use strict;
 use warnings FATAL => 'all';
 use Test::Nginx::Socket::Lua;
-use t::Util;
+do "./t/Util.pm";
 
 $ENV{TEST_NGINX_NXSOCK} ||= html_dir();
 
@@ -38,6 +38,7 @@ qq{
                 rewrite       = "forced false",
                 access        = false,
                 header_filter = true,
+                response      = true,
                 body_filter   = true,
                 log           = true,
                 admin_api     = true,
@@ -49,6 +50,7 @@ qq{
                 rewrite       = "forced false",
                 access        = false,
                 header_filter = true,
+                response      = true,
                 body_filter   = true,
                 log           = true,
                 admin_api     = true,
@@ -60,6 +62,7 @@ qq{
                 rewrite       = "forced false",
                 access        = false,
                 header_filter = true,
+                response      = true,
                 body_filter   = true,
                 log           = true,
                 admin_api     = true,
@@ -71,6 +74,7 @@ qq{
                 rewrite       = "forced false",
                 access        = false,
                 header_filter = true,
+                response      = true,
                 body_filter   = true,
                 log           = true,
                 admin_api     = true,
@@ -82,6 +86,7 @@ qq{
                 rewrite       = true,
                 access        = true,
                 header_filter = true,
+                response      = true,
                 body_filter   = false,
                 log           = false,
                 admin_api     = true,
@@ -93,6 +98,7 @@ qq{
                 rewrite       = true,
                 access        = true,
                 header_filter = true,
+                response      = true,
                 body_filter   = false,
                 log           = false,
                 admin_api     = true,
@@ -104,6 +110,7 @@ qq{
                 rewrite       = true,
                 access        = true,
                 header_filter = true,
+                response      = true,
                 body_filter   = false,
                 log           = false,
                 admin_api     = true,
@@ -115,6 +122,7 @@ qq{
                 rewrite       = true,
                 access        = true,
                 header_filter = true,
+                response      = true,
                 body_filter   = false,
                 log           = false,
                 admin_api     = true,
@@ -126,6 +134,7 @@ qq{
                 rewrite       = true,
                 access        = true,
                 header_filter = true,
+                response      = true,
                 body_filter   = false,
                 log           = false,
                 admin_api     = true,
@@ -137,6 +146,7 @@ qq{
                 rewrite       = true,
                 access        = true,
                 header_filter = "pending",
+                response      = true,
                 body_filter   = false,
                 log           = false,
                 admin_api     = true,
@@ -148,6 +158,7 @@ qq{
                 rewrite       = "forced false",
                 access        = "forced false",
                 header_filter = true,
+                response      = true,
                 body_filter   = true,
                 log           = true,
                 admin_api     = true,
@@ -159,9 +170,34 @@ qq{
                 rewrite       = true,
                 access        = true,
                 header_filter = "pending",
+                response      = true,
                 body_filter   = false,
                 log           = false,
                 admin_api     = true,
+            }, {
+                method        = "get_raw_body",
+                args          = { },
+                init_worker   = false,
+                certificate   = false,
+                rewrite       = false,
+                access        = false,
+                header_filter = false,
+                response      = false,
+                body_filter   = true,
+                log           = false,
+                admin_api     = false,
+            }, {
+                method        = "set_raw_body",
+                args          = { "lorem, ipsum" },
+                init_worker   = false,
+                certificate   = false,
+                rewrite       = false,
+                access        = false,
+                header_filter = false,
+                response      = false,
+                body_filter   = true,
+                log           = false,
+                admin_api     = false,
             }
         }
 
@@ -184,6 +220,7 @@ qq{
 
         access_by_lua_block {
             phase_check_functions(phases.access)
+            phase_check_functions(phases.response)
         }
 
         header_filter_by_lua_block {
@@ -232,6 +269,7 @@ qq{
                 rewrite       = true,
                 access        = true,
                 header_filter = "pending",
+                response      = true,
                 body_filter   = false,
                 log           = false,
                 admin_api     = true,

@@ -1,3 +1,12 @@
 return {
-  fields = {}
+  name = "cache",
+  fields = {
+    {
+      config = {
+        type = "record",
+        fields = {
+        },
+      },
+    },
+  },
 }

@@ -7,15 +7,14 @@ simply consult the [Suggested upgrade path](#suggested-upgrade-path).
 ## Suggested upgrade path
 
 Unless indicated otherwise in one of the upgrade paths of this document, it is
-possible to upgrade Kong **without downtime**:
+possible to upgrade Kong **without downtime**.
 
 Assuming that Kong is already running on your system, acquire the latest
-version from any of the available [installation
-methods](https://getkong.org/install/) and proceed to install it, overriding
-your previous installation.
+version from any of the available [installation methods](https://getkong.org/install/)
+and proceed to install it, overriding your previous installation.
 
-If you are planning to make modifications to your configuration, this is a
-good time to do so.
+**If you are planning to make modifications to your configuration, this is a
+good time to do so**.
 
 Then, run migration to upgrade your database schema:
 
@@ -25,7 +24,7 @@ $ kong migrations up [-c configuration_file]
 
 If the command is successful, and no migration ran
 (no output), then you only have to
-[reload](https://docs.konghq.com/1.0.x/cli/#kong-reload) Kong:
+[reload](https://docs.konghq.com/gateway-oss/2.8.x/cli/#kong-reload) Kong:
 
 ```shell
 $ kong reload [-c configuration_file]
@@ -36,6 +35,1400 @@ starts new workers, which take over from old workers before those old workers
 are terminated. In this way, Kong will serve new requests via the new
 configuration, without dropping existing in-flight connections.
 
+## Upgrade to 3.0.x
+
+Kong adheres to [semantic versioning](https://semver.org/), which makes a
+distinction between "major", "minor", and "patch" versions. The upgrade path
+will differ depending on which version you are migrating from.
+
+Kong 3.0.x is a major upgrade,
+please be aware of any [breaking changes](https://github.com/Kong/kong/blob/release/3.0.x/CHANGELOG.md#breaking-changes)
+between the 2.x and 3.x series. For 1.x series, please also refer to
+[breaking changes of 2.x](#breaking-changes-2.0.0).
+
+### Dependencies
+
+If you are using the prebuilt images/packages, you can skip this section 
+as they have bundled all dependencies required by Kong.
+
+If you are building your dependencies manually, you will need to rebuild them
+with the latest patches as there are changes since the previous release.
+
+The required version of OpenResty is bumped up to [1.21.4.1](https://openresty.org/en/ann-1021004001.html).
+We recommend you to use the [openresty-build-tools](https://github.com/Kong/kong-build-tools/tree/master/openresty-build-tools),
+which allows you to build OpenResty with the necessary patches and modules more easily.
+
+
+### Template changes
+
+There are **changes in the Nginx configuration file**, between Kong 2.x.x and 3.0.x
+
+To view the configuration changes between versions, clone the
+[Kong repository](https://github.com/kong/kong) and run `git diff`
+on the configuration templates, using `-w` for greater readability.
+
+Here's how to see the differences between previous versions and 3.0.x:
+
+```
+git clone https://github.com/kong/kong
+cd kong
+git diff -w 2.x.x 3.0.0 kong/templates/nginx_kong*.lua
+```
+
+**Note:** Adjust the starting version number
+(2.x.x) to the version number of Kong you are currently running.
+
+To produce a patch file, use the following command:
+
+```
+git diff 2.x.x 3.0.0 kong/templates/nginx_kong*.lua > kong_config_changes.diff
+```
+
+**Note:** Adjust the starting version number
+(2.x.x) to the version number of Kong you are currently running.
+
+
+### Suggested upgrade methods
+
+Follow the migration guide for the backing datastore you are using.
+If you prefer to use a fresh datastore and migrate your `kong.conf` file only,
+see [how to install 3.0.x on a fresh datastore](#install-30x-on-a-fresh-data-store).
+
+**Always backup your datastore before performing any upgrade.**
+
+You should avoid making changes to configuration with the Admin API during migration,
+as it may lead to unexpected/incompatible behavior and could break your existing configuration.
+
+**Version prerequisites for migrating to version 3.0.x**
+
+If you are migrating from Kong 2.7.x or lower versions, first [migrate to Kong 2.8.1](#upgrade-from-10x---22x-to-28x). Confirm Kong's behavior is correct after migrating to 2.8.x before proceeding with the major version upgrade to 3.0.0.
+
+For Hybrid mode deployments, both the Control Planes and Data Planes should be on 2.8.x before attempting
+with the 3.0.x major version upgrade.
+
+Once you have upgraded to Kong 2.8.x and confirmed everything still works as expected, you can follow the following steps to migrate 
+to 3.0.x.
+
+### Upgrade from 2.8.x to 3.0.x for Traditional mode
+
+
+1. Backup & clone Kong datastore into a separate instance.
+2. Download & install Kong 3.0.x, and configure it to use the newly cloned datastore. 
+3. Run `kong migrations up` and `kong migrations finish` to migrate the cloned datastore into 3.0.x format.
+3. Start the 3.0.x cluster with the cloned datastore.
+4. Now both the old (2.8.x) and new (3.0.x)
+   cluster are running simultaneously. Start provisioning more 3.0.x nodes if necessary.
+5. Gradually shift traffic from your old cluster to
+   your 3.0.x cluster. Monitor your traffic to make sure everything
+   is going smoothly.
+6. Stop your old cluster when your traffic is fully shifted to the 3.0.x cluster.
+
+### Upgrade to 3.0.x for Hybrid mode
+
+Data Planes (DPs) are capable of serving traffic normally during the entire migration, but will not be able to accept any new config updates until the upgrade finishes.
+
+1. Download & install Kong 3.0.x.
+2. Stop your existing Control Planes (CPs), DP will not be able to receive config updates, but will retain the
+   last valid config and keep functioning normally.
+   as your old one. Run `kong migrations up` and `kong migrations finish`.
+3. Start the newly installed 3.0.x CP. Old DPs are expected to complain
+about connection failure to the CP in the log, for example:
+`connection to Control Plane ... broken: failed to connect: connection refused` but this is perfectly okay during the upgrade ad does not affect normal proxy traffic.
+4. Start provisioning 3.0.x DPs.
+5. Gradually shift traffic from your old 2.8.x DPs to
+   your 3.0.x DPs. Monitor your traffic to make sure everything
+   is going smoothly.
+6. Stop your old DPs when your traffic is fully shifted to 3.0.x DPs.
+
+### Installing 3.0.x on a fresh datastore
+
+The following commands should be used to prepare a new 3.0.x cluster from a
+fresh datastore. By default, the `kong` CLI tool will load the configuration
+from `/etc/kong/kong.conf`, but you can use the optional flag `-c` to
+specify a configuration file:
+
+```
+$ kong migrations bootstrap [-c /path/to/your/kong.conf]
+$ kong start [-c /path/to/your/kong.conf]
+```
+Unless indicated otherwise in one of the upgrade paths of this document, it is
+possible to upgrade Kong **without downtime**.
+
+Assuming that Kong is already running on your system, acquire the latest
+version from any of the available [installation methods](https://getkong.org/install/)
+and proceed to install it, overriding your previous installation.
+
+**If you are planning to make modifications to your configuration, this is a
+good time to do so**.
+
+Then, run migrations to upgrade your datastore schema:
+
+```shell
+$ kong migrations up [-c configuration_file]
+```
+
+If the command is successful, and no migration ran
+(no output), then you only have to
+[reload](https://docs.konghq.com/gateway-oss/3.0.x/cli/#kong-reload) Kong:
+
+```shell
+$ kong reload [-c configuration_file]
+```
+
+**Reminder**: `kong reload` leverages the Nginx `reload` signal that seamlessly
+starts new workers, which take over from old workers before those old workers
+are terminated. In this way, Kong will serve new requests via the new
+configuration, without dropping existing in-flight connections.
+
+
+## Upgrade to 2.8.x
+
+Kong adheres to [semantic versioning](https://semver.org/), which makes a
+distinction between "major", "minor", and "patch" versions. The upgrade path
+will be different depending on which previous version from which you are migrating.
+
+If you are migrating from 2.x.x, upgrading into 2.8.x is a
+minor upgrade, but read below for important instructions on database migration,
+especially for Cassandra users.
+
+If you are migrating from 1.x, upgrading into 2.8.x is a major upgrade,
+so, in addition, be aware of any [breaking changes](https://github.com/Kong/kong/blob/master/UPGRADE.md#breaking-changes-2.0)
+between the 1.x and 2.x series below, further detailed in the
+[CHANGELOG.md](https://github.com/Kong/kong/blob/2.0.0/CHANGELOG.md#200) document.
+
+
+### Dependencies
+
+If you are using the provided binary packages, all necessary dependencies
+for the gateway are bundled and you can skip this section.
+
+If you are building your dependencies by hand, there are changes since the
+previous release, so you will need to rebuild them with the latest patches.
+
+The required OpenResty version for kong 2.8.x is
+[1.19.9.1](https://openresty.org/en/changelog-1019003.html). This is more recent
+than the version in Kong 2.5.0 (which used `1.19.3.2`). In addition to an upgraded
+OpenResty, you will need the correct [OpenResty patches](https://github.com/Kong/kong-build-tools/tree/master/openresty-build-tools/openresty-patches)
+for this new version, including the latest release of [lua-kong-nginx-module](https://github.com/Kong/lua-kong-nginx-module).
+The [kong-build-tools](https://github.com/Kong/kong-build-tools)
+repository contains [openresty-build-tools](https://github.com/Kong/kong-build-tools/tree/master/openresty-build-tools),
+which allows you to more easily build OpenResty with the necessary patches and modules.
+
+There is a new way to deploy Go using Plugin Servers.
+For more information, see [Developing Go plugins](https://docs.konghq.com/gateway-oss/2.6.x/external-plugins/#developing-go-plugins).
+
+### Template changes
+
+There are **Changes in the Nginx configuration file**, between kong 2.0.x,
+2.1.x, 2.2.x, 2.3.x, 2.4.x, 2.5.x, 2.6.x, 2.7.x and 2.8.x
+
+To view the configuration changes between versions, clone the
+[Kong repository](https://github.com/kong/kong) and run `git diff`
+on the configuration templates, using `-w` for greater readability.
+
+Here's how to see the differences between previous versions and 2.8.x:
+
+```
+git clone https://github.com/kong/kong
+cd kong
+git diff -w 2.0.0 2.8.0 kong/templates/nginx_kong*.lua
+```
+
+**Note:** Adjust the starting version number
+(2.0.x, 2.1.x, 2.2.x, 2.3.x, 2.4.x, 2.5.x, 2.6.x, 2.7.x) to the version number you are currently using.
+
+To produce a patch file, use the following command:
+
+```
+git diff 2.0.0 2.8.0 kong/templates/nginx_kong*.lua > kong_config_changes.diff
+```
+
+**Note:** Adjust the starting version number
+(2.0.x, 2.1.x, 2.2.x, 2.3.x, 2.4.x, 2.5.x, 2.6.x, 2.7.x) to the version number you are currently using.
+
+
+### Suggested upgrade path
+
+**Version prerequisites for migrating to version 2.8.x**
+
+The lowest version that Kong 2.8.x supports migrating from is 1.0.x.
+If you are migrating from a version lower than 0.14.1, you need to
+migrate to 0.14.1 first. Then, once you are migrating from 0.14.1,
+please migrate to 1.5.x first.
+
+The steps for upgrading from 0.14.1 to 1.5.x are the same as upgrading
+from 0.14.1 to Kong 1.0. Please follow the steps described in the
+"Migration Steps from 0.14" in the
+
+[Suggested Upgrade Path for Kong 1.0](https://github.com/Kong/kong/blob/master/UPGRADE.md#kong-1-0-upgrade-path)
+with the addition of the `kong migrations migrate-apis` command,
+which you can use to migrate legacy `apis` configurations.
+
+Once you migrated to 1.5.x, you can follow the instructions in the section
+below to migrate to 2.8.x.
+
+### Upgrade from 1.0.x - 2.2.x to 2.8.x
+
+**Postgres**
+
+Kong 2.8.x supports a no-downtime migration model. This means that while the
+migration is ongoing, you will have two Kong clusters running, sharing the
+same database. (This is sometimes called the Blue/Green migration model.)
+
+The migrations are designed so that the new version of Kong is able to use
+the database as it is migrated while the old Kong cluster keeps working until
+it is time to decommission it. For this reason, the migration is split into
+two steps, performed via commands `kong migrations up` (which does
+only non-destructive operations) and `kong migrations finish` (which puts the
+database in the final expected state for Kong 2.8.x).
+
+1. Download 2.8.x, and configure it to point to the same datastore
+   as your old (1.0 to 2.0) cluster. Run `kong migrations up`.
+2. After that finishes running, both the old (2.x.x) and new (2.8.x)
+   clusters can now run simultaneously. Start provisioning 2.8.x nodes,
+   but do not use their Admin API yet. If you need to perform Admin API
+   requests, these should be made to the old cluster's nodes. The reason
+   is to prevent the new cluster from generating data that is not understood
+   by the old cluster.
+3. Gradually divert traffic away from your old nodes, and into
+   your 2.8.x cluster. Monitor your traffic to make sure everything
+   is going smoothly.
+4. When your traffic is fully migrated to the 2.8.x cluster,
+   decommission your old nodes.
+5. From your 2.8.x cluster, run: `kong migrations finish`.
+   From this point on, it will not be possible to start
+   nodes in the old cluster pointing to the same datastore anymore. Only run
+   this command when you are confident that your migration
+   was successful. From now on, you can safely make Admin API
+   requests to your 2.8.x nodes.
+
+**Cassandra**
+
+Deprecation notice:
+Cassandra as a backend database for Kong Gateway is deprecated. This means the feature will eventually be removed. Our target for Cassandra removal is the Kong Gateway 4.0 release, and some new features might not be supported with Cassandra in the Kong Gateway 3.0 release.
+
+Due to internal changes, the table schemas used by Kong 2.8.x on Cassandra
+are incompatible with those used by Kong 2.1.x (or lower). Migrating using the usual commands
+`kong migrations up` and `kong migrations finish` will require a small
+window of downtime, since the old and new versions cannot use the
+database at the same time. Alternatively, to keep your previous version fully
+operational while the new one initializes, you will need to transfer the
+data to a new keyspace via a database dump, as described below:
+
+1. Download 2.8.x, and configure it to point to a new keyspace.
+   Run `kong migrations bootstrap`.
+2. Once that finishes running, both the old (pre-2.1) and new (2.8.x)
+   clusters can now run simultaneously, but the new cluster does not
+   have any data yet.
+3. On the old cluster, run `kong config db_export`. This will create
+   a file `kong.yml` with a database dump.
+4. Transfer the file to the new cluster and run
+   `kong config db_import kong.yml`. This will load the data into the new cluster.
+5. Gradually divert traffic away from your old nodes, and into
+   your 2.8.x cluster. Monitor your traffic to make sure everything
+   is going smoothly.
+6. When your traffic is fully migrated to the 2.8.x cluster,
+   decommission your old nodes.
+
+### Installing 2.8.x on a fresh datastore
+
+The following commands should be used to prepare a new 2.8.x cluster from a
+fresh datastore. By default the `kong` CLI tool will load the configuration
+from `/etc/kong/kong.conf`, but you can optionally use the flag `-c` to
+indicate the path to your configuration file:
+
+```
+$ kong migrations bootstrap [-c /path/to/your/kong.conf]
+$ kong start [-c /path/to/your/kong.conf]
+```
+Unless indicated otherwise in one of the upgrade paths of this document, it is
+possible to upgrade Kong **without downtime**.
+
+Assuming that Kong is already running on your system, acquire the latest
+version from any of the available [installation methods](https://getkong.org/install/)
+and proceed to install it, overriding your previous installation.
+
+**If you are planning to make modifications to your configuration, this is a
+good time to do so**.
+
+Then, run migration to upgrade your database schema:
+
+```shell
+$ kong migrations up [-c configuration_file]
+```
+
+If the command is successful, and no migration ran
+(no output), then you only have to
+[reload](https://docs.konghq.com/gateway-oss/2.8.x/cli/#kong-reload) Kong:
+
+```shell
+$ kong reload [-c configuration_file]
+```
+
+**Reminder**: `kong reload` leverages the Nginx `reload` signal that seamlessly
+starts new workers, which take over from old workers before those old workers
+are terminated. In this way, Kong will serve new requests via the new
+configuration, without dropping existing in-flight connections.
+
+## Upgrade to 2.7.x
+
+Kong adheres to [semantic versioning](https://semver.org/), which makes a
+distinction between "major", "minor", and "patch" versions. The upgrade path
+will be different depending on which previous version from which you are migrating.
+
+If you are migrating from 2.x.x, upgrading into 2.7.x is a
+minor upgrade, but read below for important instructions on database migration,
+especially for Cassandra users.
+
+If you are migrating from 1.x, upgrading into 2.7.x is a major upgrade,
+so, in addition, be aware of any [breaking changes](https://github.com/Kong/kong/blob/master/UPGRADE.md#breaking-changes-2.0)
+between the 1.x and 2.x series below, further detailed in the
+[CHANGELOG.md](https://github.com/Kong/kong/blob/2.0.0/CHANGELOG.md#200) document.
+
+
+### Dependencies
+
+If you are using the provided binary packages, all necessary dependencies
+for the gateway are bundled and you can skip this section.
+
+If you are building your dependencies by hand, there are changes since the
+previous release, so you will need to rebuild them with the latest patches.
+
+The required OpenResty version for kong 2.7.x is
+[1.19.9.1](https://openresty.org/en/changelog-1019003.html). This is more recent
+than the version in Kong 2.5.0 (which used `1.19.3.2`). In addition to an upgraded
+OpenResty, you will need the correct [OpenResty patches](https://github.com/Kong/kong-build-tools/tree/master/openresty-build-tools/openresty-patches)
+for this new version, including the latest release of [lua-kong-nginx-module](https://github.com/Kong/lua-kong-nginx-module).
+The [kong-build-tools](https://github.com/Kong/kong-build-tools)
+repository contains [openresty-build-tools](https://github.com/Kong/kong-build-tools/tree/master/openresty-build-tools),
+which allows you to more easily build OpenResty with the necessary patches and modules.
+
+There is a new way to deploy Go using Plugin Servers.
+For more information, see [Developing Go plugins](https://docs.konghq.com/gateway-oss/2.6.x/external-plugins/#developing-go-plugins).
+
+### Template changes
+
+There are **Changes in the Nginx configuration file**, between kong 2.0.x,
+2.1.x, 2.2.x, 2.3.x, 2.4.x, 2.5.x, 2.6.x and 2.7.x
+
+To view the configuration changes between versions, clone the
+[Kong repository](https://github.com/kong/kong) and run `git diff`
+on the configuration templates, using `-w` for greater readability.
+
+Here's how to see the differences between previous versions and 2.7.x:
+
+```
+git clone https://github.com/kong/kong
+cd kong
+git diff -w 2.0.0 2.7.0 kong/templates/nginx_kong*.lua
+```
+
+**Note:** Adjust the starting version number
+(2.0.x, 2.1.x, 2.2.x, 2.3.x, 2.4.x, 2.5.x, 2.6.x, 2.7.x) to the version number you are currently using.
+
+To produce a patch file, use the following command:
+
+```
+git diff 2.0.0 2.7.0 kong/templates/nginx_kong*.lua > kong_config_changes.diff
+```
+
+**Note:** Adjust the starting version number
+(2.0.x, 2.1.x, 2.2.x, 2.3.x, 2.4.x, 2.5.x, 2.6.x, 2.7.x) to the version number you are currently using.
+
+
+### Suggested upgrade path
+
+**Version prerequisites for migrating to version 2.7.x**
+
+The lowest version that Kong 2.7.x supports migrating from is 1.0.x.
+If you are migrating from a version lower than 0.14.1, you need to
+migrate to 0.14.1 first. Then, once you are migrating from 0.14.1,
+please migrate to 1.5.x first.
+
+The steps for upgrading from 0.14.1 to 1.5.x are the same as upgrading
+from 0.14.1 to Kong 1.0. Please follow the steps described in the
+"Migration Steps from 0.14" in the
+
+[Suggested Upgrade Path for Kong 1.0](https://github.com/Kong/kong/blob/master/UPGRADE.md#kong-1-0-upgrade-path)
+with the addition of the `kong migrations migrate-apis` command,
+which you can use to migrate legacy `apis` configurations.
+
+Once you migrated to 1.5.x, you can follow the instructions in the section
+below to migrate to 2.7.x.
+
+### Upgrade from 1.0.x - 2.2.x to 2.7.x
+
+**Postgres**
+
+Kong 2.7.x supports a no-downtime migration model. This means that while the
+migration is ongoing, you will have two Kong clusters running, sharing the
+same database. (This is sometimes called the Blue/Green migration model.)
+
+The migrations are designed so that the new version of Kong is able to use
+the database as it is migrated while the old Kong cluster keeps working until
+it is time to decommission it. For this reason, the migration is split into
+two steps, performed via commands `kong migrations up` (which does
+only non-destructive operations) and `kong migrations finish` (which puts the
+database in the final expected state for Kong 2.7.x).
+
+1. Download 2.7.x, and configure it to point to the same datastore
+   as your old (1.0 to 2.0) cluster. Run `kong migrations up`.
+2. After that finishes running, both the old (2.x.x) and new (2.7.x)
+   clusters can now run simultaneously. Start provisioning 2.7.x nodes,
+   but do not use their Admin API yet. If you need to perform Admin API
+   requests, these should be made to the old cluster's nodes. The reason
+   is to prevent the new cluster from generating data that is not understood
+   by the old cluster.
+3. Gradually divert traffic away from your old nodes, and into
+   your 2.7.x cluster. Monitor your traffic to make sure everything
+   is going smoothly.
+4. When your traffic is fully migrated to the 2.7.x cluster,
+   decommission your old nodes.
+5. From your 2.7.x cluster, run: `kong migrations finish`.
+   From this point on, it will not be possible to start
+   nodes in the old cluster pointing to the same datastore anymore. Only run
+   this command when you are confident that your migration
+   was successful. From now on, you can safely make Admin API
+   requests to your 2.7.x nodes.
+
+**Cassandra**
+
+Deprecation notice:
+Cassandra as a backend database for Kong Gateway is deprecated. This means the feature will eventually be removed. Our target for Cassandra removal is the Kong Gateway 4.0 release, and some new features might not be supported with Cassandra in the Kong Gateway 3.0 release.
+
+Due to internal changes, the table schemas used by Kong 2.7.x on Cassandra
+are incompatible with those used by Kong 2.1.x (or lower). Migrating using the usual commands
+`kong migrations up` and `kong migrations finish` will require a small
+window of downtime, since the old and new versions cannot use the
+database at the same time. Alternatively, to keep your previous version fully
+operational while the new one initializes, you will need to transfer the
+data to a new keyspace via a database dump, as described below:
+
+1. Download 2.7.x, and configure it to point to a new keyspace.
+   Run `kong migrations bootstrap`.
+2. Once that finishes running, both the old (pre-2.1) and new (2.7.x)
+   clusters can now run simultaneously, but the new cluster does not
+   have any data yet.
+3. On the old cluster, run `kong config db_export`. This will create
+   a file `kong.yml` with a database dump.
+4. Transfer the file to the new cluster and run
+   `kong config db_import kong.yml`. This will load the data into the new cluster.
+5. Gradually divert traffic away from your old nodes, and into
+   your 2.7.x cluster. Monitor your traffic to make sure everything
+   is going smoothly.
+6. When your traffic is fully migrated to the 2.7.x cluster,
+   decommission your old nodes.
+
+### Installing 2.7.x on a fresh datastore
+
+The following commands should be used to prepare a new 2.7.x cluster from a
+fresh datastore. By default the `kong` CLI tool will load the configuration
+from `/etc/kong/kong.conf`, but you can optionally use the flag `-c` to
+indicate the path to your configuration file:
+
+```
+$ kong migrations bootstrap [-c /path/to/your/kong.conf]
+$ kong start [-c /path/to/your/kong.conf]
+```
+Unless indicated otherwise in one of the upgrade paths of this document, it is
+possible to upgrade Kong **without downtime**.
+
+Assuming that Kong is already running on your system, acquire the latest
+version from any of the available [installation methods](https://getkong.org/install/)
+and proceed to install it, overriding your previous installation.
+
+**If you are planning to make modifications to your configuration, this is a
+good time to do so**.
+
+Then, run migration to upgrade your database schema:
+
+```shell
+$ kong migrations up [-c configuration_file]
+```
+
+If the command is successful, and no migration ran
+(no output), then you only have to
+[reload](https://docs.konghq.com/gateway-oss/2.7.x/cli/#kong-reload) Kong:
+
+```shell
+$ kong reload [-c configuration_file]
+```
+
+**Reminder**: `kong reload` leverages the Nginx `reload` signal that seamlessly
+starts new workers, which take over from old workers before those old workers
+are terminated. In this way, Kong will serve new requests via the new
+configuration, without dropping existing in-flight connections.
+
+## Upgrade to 2.6.x
+
+Kong adheres to [semantic versioning](https://semver.org/), which makes a
+distinction between "major", "minor", and "patch" versions. The upgrade path
+will be different depending on which previous version from which you are migrating.
+
+If you are migrating from 2.0.x, 2.1.x, 2.2.x or 2.3.x, 2.4.x or 2.5.x into 2.6.x is a
+minor upgrade, but read below for important instructions on database migration,
+especially for Cassandra users.
+
+If you are migrating from 1.x, upgrading into 2.6.x is a major upgrade,
+so, in addition, be aware of any [breaking changes](https://github.com/Kong/kong/blob/master/UPGRADE.md#breaking-changes-2.0)
+between the 1.x and 2.x series below, further detailed in the
+[CHANGELOG.md](https://github.com/Kong/kong/blob/2.0.0/CHANGELOG.md#200) document.
+
+
+### Dependencies
+
+If you are using the provided binary packages, all necessary dependencies
+for the gateway are bundled and you can skip this section.
+
+If you are building your dependencies by hand, there are changes since the
+previous release, so you will need to rebuild them with the latest patches.
+
+The required OpenResty version for kong 2.6.x is
+[1.19.9.1](https://openresty.org/en/changelog-1019003.html). This is more recent
+than the version in Kong 2.5.0 (which used `1.19.3.2`). In addition to an upgraded
+OpenResty, you will need the correct [OpenResty patches](https://github.com/Kong/kong-build-tools/tree/master/openresty-build-tools/openresty-patches)
+for this new version, including the latest release of [lua-kong-nginx-module](https://github.com/Kong/lua-kong-nginx-module).
+The [kong-build-tools](https://github.com/Kong/kong-build-tools)
+repository contains [openresty-build-tools](https://github.com/Kong/kong-build-tools/tree/master/openresty-build-tools),
+which allows you to more easily build OpenResty with the necessary patches and modules.
+
+There is a new way to deploy Go using Plugin Servers.
+For more information, see [Developing Go plugins](https://docs.konghq.com/gateway-oss/2.7.x/external-plugins/#developing-go-plugins).
+
+### Template changes
+
+There are **Changes in the Nginx configuration file**, between kong 2.0.x,
+2.1.x, 2.2.x, 2.3.x, 2.4.x and 2.5.x.
+
+To view the configuration changes between versions, clone the
+[Kong repository](https://github.com/kong/kong) and run `git diff`
+on the configuration templates, using `-w` for greater readability.
+
+Here's how to see the differences between previous versions and 2.6.x:
+
+```
+git clone https://github.com/kong/kong
+cd kong
+git diff -w 2.0.0 2.6.0 kong/templates/nginx_kong*.lua
+```
+
+**Note:** Adjust the starting version number
+(2.0.x, 2.1.x, 2.2.x, 2.3.x, 2.4.x or 2.5.x) to the version number you are currently using.
+
+To produce a patch file, use the following command:
+
+```
+git diff 2.0.0 2.6.0 kong/templates/nginx_kong*.lua > kong_config_changes.diff
+```
+
+**Note:** Adjust the starting version number
+(2.0.x, 2.1.x, 2.2.x, 2.3.x, 2.4.x or 2.5.x) to the version number you are currently using.
+
+
+### Suggested upgrade path
+
+**Version prerequisites for migrating to version 2.6.x**
+
+The lowest version that Kong 2.6.x supports migrating from is 1.0.x.
+If you are migrating from a version lower than 0.14.1, you need to
+migrate to 0.14.1 first. Then, once you are migrating from 0.14.1,
+please migrate to 1.5.x first.
+
+The steps for upgrading from 0.14.1 to 1.5.x are the same as upgrading
+from 0.14.1 to Kong 1.0. Please follow the steps described in the
+"Migration Steps from 0.14" in the
+
+[Suggested Upgrade Path for Kong 1.0](https://github.com/Kong/kong/blob/master/UPGRADE.md#kong-1-0-upgrade-path)
+with the addition of the `kong migrations migrate-apis` command,
+which you can use to migrate legacy `apis` configurations.
+
+Once you migrated to 1.5.x, you can follow the instructions in the section
+below to migrate to 2.6.x.
+
+### Upgrade from 1.0.x - 2.2.x to 2.6.x
+
+**Postgres**
+
+Kong 2.6.x supports a no-downtime migration model. This means that while the
+migration is ongoing, you will have two Kong clusters running, sharing the
+same database. (This is sometimes called the Blue/Green migration model.)
+
+The migrations are designed so that the new version of Kong is able to use
+the database as it is migrated while the old Kong cluster keeps working until
+it is time to decommission it. For this reason, the migration is split into
+two steps, performed via commands `kong migrations up` (which does
+only non-destructive operations) and `kong migrations finish` (which puts the
+database in the final expected state for Kong 2.6.x).
+
+1. Download 2.6.x, and configure it to point to the same datastore
+   as your old (1.0 to 2.0) cluster. Run `kong migrations up`.
+2. After that finishes running, both the old (2.x.x) and new (2.6.x)
+   clusters can now run simultaneously. Start provisioning 2.6.x nodes,
+   but do not use their Admin API yet. If you need to perform Admin API
+   requests, these should be made to the old cluster's nodes. The reason
+   is to prevent the new cluster from generating data that is not understood
+   by the old cluster.
+3. Gradually divert traffic away from your old nodes, and into
+   your 2.6.x cluster. Monitor your traffic to make sure everything
+   is going smoothly.
+4. When your traffic is fully migrated to the 2.6.x cluster,
+   decommission your old nodes.
+5. From your 2.6.x cluster, run: `kong migrations finish`.
+   From this point on, it will not be possible to start
+   nodes in the old cluster pointing to the same datastore anymore. Only run
+   this command when you are confident that your migration
+   was successful. From now on, you can safely make Admin API
+   requests to your 2.6.x nodes.
+
+**Cassandra**
+
+Due to internal changes, the table schemas used by Kong 2.6.x on Cassandra
+are incompatible with those used by Kong 2.1.x (or lower). Migrating using the usual commands
+`kong migrations up` and `kong migrations finish` will require a small
+window of downtime, since the old and new versions cannot use the
+database at the same time. Alternatively, to keep your previous version fully
+operational while the new one initializes, you will need to transfer the
+data to a new keyspace via a database dump, as described below:
+
+1. Download 2.6.x, and configure it to point to a new keyspace.
+   Run `kong migrations bootstrap`.
+2. Once that finishes running, both the old (pre-2.1) and new (2.6.x)
+   clusters can now run simultaneously, but the new cluster does not
+   have any data yet.
+3. On the old cluster, run `kong config db_export`. This will create
+   a file `kong.yml` with a database dump.
+4. Transfer the file to the new cluster and run
+   `kong config db_import kong.yml`. This will load the data into the new cluster.
+5. Gradually divert traffic away from your old nodes, and into
+   your 2.6.x cluster. Monitor your traffic to make sure everything
+   is going smoothly.
+6. When your traffic is fully migrated to the 2.6.x cluster,
+   decommission your old nodes.
+
+### Installing 2.6.x on a fresh datastore
+
+The following commands should be used to prepare a new 2.6.x cluster from a
+fresh datastore. By default the `kong` CLI tool will load the configuration
+from `/etc/kong/kong.conf`, but you can optionally use the flag `-c` to
+indicate the path to your configuration file:
+
+```
+$ kong migrations bootstrap [-c /path/to/your/kong.conf]
+$ kong start [-c /path/to/your/kong.conf]
+```
+Unless indicated otherwise in one of the upgrade paths of this document, it is
+possible to upgrade Kong **without downtime**.
+
+Assuming that Kong is already running on your system, acquire the latest
+version from any of the available [installation methods](https://getkong.org/install/)
+and proceed to install it, overriding your previous installation.
+
+**If you are planning to make modifications to your configuration, this is a
+good time to do so**.
+
+Then, run migration to upgrade your database schema:
+
+```shell
+$ kong migrations up [-c configuration_file]
+```
+
+If the command is successful, and no migration ran
+(no output), then you only have to
+[reload](https://docs.konghq.com/gateway-oss/2.6.x/cli/#kong-reload) Kong:
+
+```shell
+$ kong reload [-c configuration_file]
+```
+
+**Reminder**: `kong reload` leverages the Nginx `reload` signal that seamlessly
+starts new workers, which take over from old workers before those old workers
+are terminated. In this way, Kong will serve new requests via the new
+configuration, without dropping existing in-flight connections.
+
+## Upgrade to `2.5.x`
+
+Kong adheres to [semantic versioning](https://semver.org/), which makes a
+distinction between "major", "minor", and "patch" versions. The upgrade path
+will be different depending on which previous version from which you are migrating.
+
+If you are migrating from 2.0.x, 2.1.x, 2.2.x, 2.3.x or 2.4.x, upgrading into 2.5.x is a
+minor upgrade, but read below for important instructions on database migration,
+especially for Cassandra users.
+
+If you are migrating from 1.x, upgrading into 2.5.x is a major upgrade,
+so, in addition, be aware of any [breaking changes](https://github.com/Kong/kong/blob/master/UPGRADE.md#breaking-changes-2.0)
+between the 1.x and 2.x series below, further detailed in the
+[CHANGELOG.md](https://github.com/Kong/kong/blob/2.0.0/CHANGELOG.md#200) document.
+
+
+### Dependencies
+
+If you are using the provided binary packages, all necessary dependencies
+for the gateway are bundled and you can skip this section.
+
+If you are building your dependencies by hand, there are changes since the
+previous release, so you will need to rebuild them with the latest patches.
+
+The required OpenResty version for kong 2.5.x is
+[1.19.3.2](https://openresty.org/en/changelog-1019003.html). This is more recent
+than the version in Kong 2.3.0 (which used `1.19.3.2`). In addition to an upgraded
+OpenResty, you will need the correct [OpenResty patches](https://github.com/Kong/kong-build-tools/tree/master/openresty-build-tools/openresty-patches)
+for this new version, including the latest release of [lua-kong-nginx-module](https://github.com/Kong/lua-kong-nginx-module).
+The [kong-build-tools](https://github.com/Kong/kong-build-tools)
+repository contains [openresty-build-tools](https://github.com/Kong/kong-build-tools/tree/master/openresty-build-tools),
+which allows you to more easily build OpenResty with the necessary patches and modules.
+
+There is a new way to deploy Go using Plugin Servers.
+For more information, see [Developing Go plugins](https://docs.konghq.com/gateway-oss/2.5.x/external-plugins/#developing-go-plugins).
+
+### Template changes
+
+There are **Changes in the Nginx configuration file**, between kong 2.0.x,
+2.1.x, 2.2.x, 2.3.x, 2.4.x and 2.5.x.
+
+To view the configuration changes between versions, clone the
+[Kong repository](https://github.com/kong/kong) and run `git diff`
+on the configuration templates, using `-w` for greater readability.
+
+Here's how to see the differences between previous versions and 2.5.x:
+
+```
+git clone https://github.com/kong/kong
+cd kong
+git diff -w 2.0.0 2.5.0 kong/templates/nginx_kong*.lua
+```
+
+**Note:** Adjust the starting version number
+(2.0.x, 2.1.x, 2.2.x, 2.3.x or 2.4.x) to the version number you are currently using.
+
+To produce a patch file, use the following command:
+
+```
+git diff 2.0.0 2.5.0 kong/templates/nginx_kong*.lua > kong_config_changes.diff
+```
+
+**Note:** Adjust the starting version number
+(2.0.x, 2.1.x, 2.2.x, 2.3.x or 2.4.x) to the version number you are currently using.
+
+
+### Suggested upgrade path
+
+**Version prerequisites for migrating to version 2.5.x**
+
+The lowest version that Kong 2.5.x supports migrating from is 1.0.x.
+If you are migrating from a version lower than 0.14.1, you need to
+migrate to 0.14.1 first. Then, once you are migrating from 0.14.1,
+please migrate to 1.5.x first.
+
+The steps for upgrading from 0.14.1 to 1.5.x are the same as upgrading
+from 0.14.1 to Kong 1.0. Please follow the steps described in the
+"Migration Steps from 0.14" in the
+
+[Suggested Upgrade Path for Kong 1.0](https://github.com/Kong/kong/blob/master/UPGRADE.md#kong-1-0-upgrade-path)
+with the addition of the `kong migrations migrate-apis` command,
+which you can use to migrate legacy `apis` configurations.
+
+Once you migrated to 1.5.x, you can follow the instructions in the section
+below to migrate to 2.5.x.
+
+### Upgrade from `1.0.x` - `2.2.x` to `2.5.x`
+
+**Postgres**
+
+Kong 2.5.x supports a no-downtime migration model. This means that while the
+migration is ongoing, you will have two Kong clusters running, sharing the
+same database. (This is sometimes called the Blue/Green migration model.)
+
+The migrations are designed so that the new version of Kong is able to use
+the database as it is migrated while the old Kong cluster keeps working until
+it is time to decommission it. For this reason, the migration is split into
+two steps, performed via commands `kong migrations up` (which does
+only non-destructive operations) and `kong migrations finish` (which puts the
+database in the final expected state for Kong 2.5.x).
+
+1. Download 2.5.x, and configure it to point to the same datastore
+   as your old (1.0 to 2.0) cluster. Run `kong migrations up`.
+2. After that finishes running, both the old (2.x.x) and new (2.5.x)
+   clusters can now run simultaneously. Start provisioning 2.5.x nodes,
+   but do not use their Admin API yet. If you need to perform Admin API
+   requests, these should be made to the old cluster's nodes. The reason
+   is to prevent the new cluster from generating data that is not understood
+   by the old cluster.
+3. Gradually divert traffic away from your old nodes, and into
+   your 2.5.x cluster. Monitor your traffic to make sure everything
+   is going smoothly.
+4. When your traffic is fully migrated to the 2.5.x cluster,
+   decommission your old nodes.
+5. From your 2.5.x cluster, run: `kong migrations finish`.
+   From this point on, it will not be possible to start
+   nodes in the old cluster pointing to the same datastore anymore. Only run
+   this command when you are confident that your migration
+   was successful. From now on, you can safely make Admin API
+   requests to your 2.5.x nodes.
+
+**Cassandra**
+
+Due to internal changes, the table schemas used by Kong 2.5.x on Cassandra
+are incompatible with those used by Kong 2.1.x (or lower). Migrating using the usual commands
+`kong migrations up` and `kong migrations finish` will require a small
+window of downtime, since the old and new versions cannot use the
+database at the same time. Alternatively, to keep your previous version fully
+operational while the new one initializes, you will need to transfer the
+data to a new keyspace via a database dump, as described below:
+
+1. Download 2.5.x, and configure it to point to a new keyspace.
+   Run `kong migrations bootstrap`.
+2. Once that finishes running, both the old (pre-2.1) and new (2.5.x)
+   clusters can now run simultaneously, but the new cluster does not
+   have any data yet.
+3. On the old cluster, run `kong config db_export`. This will create
+   a file `kong.yml` with a database dump.
+4. Transfer the file to the new cluster and run
+   `kong config db_import kong.yml`. This will load the data into the new cluster.
+5. Gradually divert traffic away from your old nodes, and into
+   your 2.5.x cluster. Monitor your traffic to make sure everything
+   is going smoothly.
+6. When your traffic is fully migrated to the 2.5.x cluster,
+   decommission your old nodes.
+
+### Installing 2.5.x on a fresh datastore
+
+The following commands should be used to prepare a new 2.5.x cluster from a
+fresh datastore. By default the `kong` CLI tool will load the configuration
+from `/etc/kong/kong.conf`, but you can optionally use the flag `-c` to
+indicate the path to your configuration file:
+
+```
+$ kong migrations bootstrap [-c /path/to/your/kong.conf]
+$ kong start [-c /path/to/your/kong.conf]
+```
+Unless indicated otherwise in one of the upgrade paths of this document, it is
+possible to upgrade Kong **without downtime**.
+
+Assuming that Kong is already running on your system, acquire the latest
+version from any of the available [installation methods](https://getkong.org/install/)
+and proceed to install it, overriding your previous installation.
+
+**If you are planning to make modifications to your configuration, this is a
+good time to do so**.
+
+Then, run migration to upgrade your database schema:
+
+```shell
+$ kong migrations up [-c configuration_file]
+```
+
+If the command is successful, and no migration ran
+(no output), then you only have to
+[reload](https://docs.konghq.com/gateway-oss/2.5.x/cli/#kong-reload) Kong:
+
+```shell
+$ kong reload [-c configuration_file]
+```
+
+**Reminder**: `kong reload` leverages the Nginx `reload` signal that seamlessly
+starts new workers, which take over from old workers before those old workers
+are terminated. In this way, Kong will serve new requests via the new
+configuration, without dropping existing in-flight connections.
+
+## Upgrade to `2.4.x`
+
+Kong adheres to [semantic versioning](https://semver.org/), which makes a
+distinction between "major", "minor", and "patch" versions. The upgrade path
+will be different depending on which previous version from which you are migrating.
+
+If you are migrating from 2.0.x, 2.1.x, 2.2.x or 2.3.x, upgrading into 2.4.x is a
+minor upgrade, but read below for important instructions on database migration,
+especially for Cassandra users.
+
+If you are migrating from 1.x, upgrading into 2.4.x is a major upgrade,
+so, in addition, be aware of any [breaking changes](https://github.com/Kong/kong/blob/master/UPGRADE.md#breaking-changes-2.0)
+between the 1.x and 2.x series below, further detailed in the
+[CHANGELOG.md](https://github.com/Kong/kong/blob/2.0.0/CHANGELOG.md#200) document.
+
+
+### Dependencies
+
+If you are using the provided binary packages, all necessary dependencies
+for the gateway are bundled and you can skip this section.
+
+If you are building your dependencies by hand, there are changes since the
+previous release, so you will need to rebuild them with the latest patches.
+
+The required OpenResty version for kong 2.4.x is
+[1.19.3.1](https://openresty.org/en/changelog-1019003.html). This is more recent
+than the version in Kong 2.3.0 (which used `1.17.8.2`). In addition to an upgraded
+OpenResty, you will need the correct [OpenResty patches](https://github.com/Kong/kong-build-tools/tree/master/openresty-build-tools/openresty-patches)
+for this new version, including the latest release of [lua-kong-nginx-module](https://github.com/Kong/lua-kong-nginx-module).
+The [kong-build-tools](https://github.com/Kong/kong-build-tools)
+repository contains [openresty-build-tools](https://github.com/Kong/kong-build-tools/tree/master/openresty-build-tools),
+which allows you to more easily build OpenResty with the necessary patches and modules.
+
+There is a new way to deploy Go using Plugin Servers.
+For more information, see [Developing Go plugins](https://docs.konghq.com/gateway-oss/2.4.x/external-plugins/#developing-go-plugins).
+
+### Template changes
+
+There are **Changes in the Nginx configuration file**, between kong 2.0.x,
+2.1.x, 2.2.x, 2.3.x and 2.4.x.
+
+To view the configuration changes between versions, clone the
+[Kong repository](https://github.com/kong/kong) and run `git diff`
+on the configuration templates, using `-w` for greater readability.
+
+Here's how to see the differences between previous versions and 2.4.x:
+
+```
+git clone https://github.com/kong/kong
+cd kong
+git diff -w 2.0.0 2.4.0 kong/templates/nginx_kong*.lua
+```
+
+**Note:** Adjust the starting version number
+(2.0.x, 2.1.x, 2.2.x or 2.3.x) to the version number you are currently using.
+
+To produce a patch file, use the following command:
+
+```
+git diff 2.0.0 2.4.0 kong/templates/nginx_kong*.lua > kong_config_changes.diff
+```
+
+**Note:** Adjust the starting version number
+(2.0.x, 2.1.x, 2.2.x or 2.3.x) to the version number you are currently using.
+
+
+### Suggested upgrade path
+
+**Version prerequisites for migrating to version 2.4.x**
+
+The lowest version that Kong 2.4.x supports migrating from is 1.0.x.
+If you are migrating from a version lower than 0.14.1, you need to
+migrate to 0.14.1 first. Then, once you are migrating from 0.14.1,
+please migrate to 1.5.x first.
+
+The steps for upgrading from 0.14.1 to 1.5.x are the same as upgrading
+from 0.14.1 to Kong 1.0. Please follow the steps described in the
+"Migration Steps from 0.14" in the
+
+[Suggested Upgrade Path for Kong 1.0](https://github.com/Kong/kong/blob/master/UPGRADE.md#kong-1-0-upgrade-path)
+with the addition of the `kong migrations migrate-apis` command,
+which you can use to migrate legacy `apis` configurations.
+
+Once you migrated to 1.5.x, you can follow the instructions in the section
+below to migrate to 2.4.x.
+
+### Upgrade from `1.0.x` - `2.2.x` to `2.4.x`
+
+**Postgres**
+
+Kong 2.4.x supports a no-downtime migration model. This means that while the
+migration is ongoing, you will have two Kong clusters running, sharing the
+same database. (This is sometimes called the Blue/Green migration model.)
+
+The migrations are designed so that the new version of Kong is able to use
+the database as it is migrated while the old Kong cluster keeps working until
+it is time to decommission it. For this reason, the migration is split into
+two steps, performed via commands `kong migrations up` (which does
+only non-destructive operations) and `kong migrations finish` (which puts the
+database in the final expected state for Kong 2.4.x).
+
+1. Download 2.4.x, and configure it to point to the same datastore
+   as your old (1.0 to 2.0) cluster. Run `kong migrations up`.
+2. After that finishes running, both the old (2.x.x) and new (2.4.x)
+   clusters can now run simultaneously. Start provisioning 2.4.x nodes,
+   but do not use their Admin API yet. If you need to perform Admin API
+   requests, these should be made to the old cluster's nodes. The reason
+   is to prevent the new cluster from generating data that is not understood
+   by the old cluster.
+3. Gradually divert traffic away from your old nodes, and into
+   your 2.4.x cluster. Monitor your traffic to make sure everything
+   is going smoothly.
+4. When your traffic is fully migrated to the 2.4.x cluster,
+   decommission your old nodes.
+5. From your 2.4.x cluster, run: `kong migrations finish`.
+   From this point on, it will not be possible to start
+   nodes in the old cluster pointing to the same datastore anymore. Only run
+   this command when you are confident that your migration
+   was successful. From now on, you can safely make Admin API
+   requests to your 2.4.x nodes.
+
+**Cassandra**
+
+Due to internal changes, the table schemas used by Kong 2.4.x on Cassandra
+are incompatible with those used by Kong 2.1.x (or lower). Migrating using the usual commands
+`kong migrations up` and `kong migrations finish` will require a small
+window of downtime, since the old and new versions cannot use the
+database at the same time. Alternatively, to keep your previous version fully
+operational while the new one initializes, you will need to transfer the
+data to a new keyspace via a database dump, as described below:
+
+1. Download 2.4.x, and configure it to point to a new keyspace.
+   Run `kong migrations bootstrap`.
+2. Once that finishes running, both the old (pre-2.1) and new (2.4.x)
+   clusters can now run simultaneously, but the new cluster does not
+   have any data yet.
+3. On the old cluster, run `kong config db_export`. This will create
+   a file `kong.yml` with a database dump.
+4. Transfer the file to the new cluster and run
+   `kong config db_import kong.yml`. This will load the data into the new cluster.
+5. Gradually divert traffic away from your old nodes, and into
+   your 2.4.x cluster. Monitor your traffic to make sure everything
+   is going smoothly.
+6. When your traffic is fully migrated to the 2.4.x cluster,
+   decommission your old nodes.
+
+### Installing 2.4.x on a fresh datastore
+
+The following commands should be used to prepare a new 2.4.x cluster from a
+fresh datastore. By default the `kong` CLI tool will load the configuration
+from `/etc/kong/kong.conf`, but you can optionally use the flag `-c` to
+indicate the path to your configuration file:
+
+```
+$ kong migrations bootstrap [-c /path/to/your/kong.conf]
+$ kong start [-c /path/to/your/kong.conf]
+```
+Unless indicated otherwise in one of the upgrade paths of this document, it is
+possible to upgrade Kong **without downtime**.
+
+Assuming that Kong is already running on your system, acquire the latest
+version from any of the available [installation methods](https://getkong.org/install/)
+and proceed to install it, overriding your previous installation.
+
+**If you are planning to make modifications to your configuration, this is a
+good time to do so**.
+
+Then, run migration to upgrade your database schema:
+
+```shell
+$ kong migrations up [-c configuration_file]
+```
+
+If the command is successful, and no migration ran
+(no output), then you only have to
+[reload](https://docs.konghq.com/gateway-oss/2.4.x/cli/#kong-reload) Kong:
+
+```shell
+$ kong reload [-c configuration_file]
+```
+
+**Reminder**: `kong reload` leverages the Nginx `reload` signal that seamlessly
+starts new workers, which take over from old workers before those old workers
+are terminated. In this way, Kong will serve new requests via the new
+configuration, without dropping existing in-flight connections.
+
+## Upgrade to `2.3.x`
+
+Kong adheres to [semantic versioning](https://semver.org/), which makes a
+distinction between "major", "minor", and "patch" versions. The upgrade path
+will be different depending on which previous version from which you are migrating.
+
+If you are migrating from 2.0.x, 2.1.x, or 2.2.x, upgrading into 2.3.x is a minor upgrade,
+but read below for important instructions on database migration, especially
+for Cassandra users.
+
+If you are migrating from 1.x, upgrading into 2.3.x is a major upgrade,
+so, in addition, be aware of any [breaking changes](https://github.com/Kong/kong/blob/master/UPGRADE.md#breaking-changes-2.0)
+between the 1.x and 2.x series below, further detailed in the
+[CHANGELOG.md](https://github.com/Kong/kong/blob/2.0.0/CHANGELOG.md#200) document.
+
+
+### Dependencies
+
+If you are using the provided binary packages, all necessary dependencies
+for the gateway are bundled and you can skip this section.
+
+If you are building your dependencies by hand, there are changes since the
+previous release, so you will need to rebuild them with the latest patches.
+
+The required OpenResty version for kong 2.3.x is
+[1.17.8.2](https://openresty.org/en/changelog-1017008.html). This is more recent
+than the version in Kong 2.1.0 (which used `1.15.8.3`). In addition to an upgraded
+OpenResty, you will need the correct [OpenResty patches](https://github.com/Kong/kong-build-tools/tree/master/openresty-build-tools/openresty-patches)
+for this new version, including the latest release of [lua-kong-nginx-module](https://github.com/Kong/lua-kong-nginx-module).
+The [kong-build-tools](https://github.com/Kong/kong-build-tools)
+repository contains [openresty-build-tools](https://github.com/Kong/kong-build-tools/tree/master/openresty-build-tools),
+which allows you to more easily build OpenResty with the necessary patches and modules.
+
+There is a new way to deploy Go using Plugin Servers.
+For more information, see [Developing Go plugins](https://docs.konghq.com/gateway-oss/2.3.x/external-plugins/#developing-go-plugins).
+
+### Template changes
+
+There are **Changes in the Nginx configuration file**, between kong 2.0.x,
+2.1.x, 2.2.x and 2.3.x.
+
+To view the configuration changes between versions, clone the
+[Kong repository](https://github.com/kong/kong) and run `git diff`
+on the configuration templates, using `-w` for greater readability.
+
+Here's how to see the differences between 2.0.x and 2.1.x, or 2.2.x and 2.3.x:
+
+```
+git clone https://github.com/kong/kong
+cd kong
+git diff -w 2.0.0 2.3.0 kong/templates/nginx_kong*.lua
+```
+
+**Note:** Adjust the starting version number
+(2.0.x, 2.1.x, or 2.2.x) to the version number you are currently using.
+
+To produce a patch file, use the following command:
+
+```
+git diff 2.0.0 2.3.0 kong/templates/nginx_kong*.lua > kong_config_changes.diff
+```
+
+**Note:** Adjust the starting version number
+(2.0.x, 2.1.x, or 2.2.x) to the version number you are currently using.
+
+
+### Suggested upgrade path
+
+**Version prerequisites for migrating to version 2.3.x**
+
+The lowest version that Kong 2.3.x supports migrating from is 1.0.x.
+If you are migrating from a version lower than 0.14.1, you need to
+migrate to 0.14.1 first. Then, once you are migrating from 0.14.1,
+please migrate to 1.5.x first.
+
+The steps for upgrading from 0.14.1 to 1.5.x are the same as upgrading
+from 0.14.1 to Kong 1.0. Please follow the steps described in the
+"Migration Steps from 0.14" in the
+
+[Suggested Upgrade Path for Kong 1.0](https://github.com/Kong/kong/blob/master/UPGRADE.md#kong-1-0-upgrade-path)
+with the addition of the `kong migrations migrate-apis` command,
+which you can use to migrate legacy `apis` configurations.
+
+Once you migrated to 1.5.x, you can follow the instructions in the section
+below to migrate to 2.3.x.
+
+### Upgrade from `1.0.x` - `2.2.x` to `2.3.x`
+
+**Postgres**
+
+Kong 2.3.x supports a no-downtime migration model. This means that while the
+migration is ongoing, you will have two Kong clusters running, sharing the
+same database. (This is sometimes called the Blue/Green migration model.)
+
+The migrations are designed so that the new version of Kong is able to use
+the database as it is migrated while the old Kong cluster keeps working until
+it is time to decommission it. For this reason, the migration is split into
+two steps, performed via commands `kong migrations up` (which does
+only non-destructive operations) and `kong migrations finish` (which puts the
+database in the final expected state for Kong 2.3.x).
+
+1. Download 2.3.x, and configure it to point to the same datastore
+   as your old (1.0 to 2.0) cluster. Run `kong migrations up`.
+2. After that finishes running, both the old (2.x.x) and new (2.3.x)
+   clusters can now run simultaneously. Start provisioning 2.3.x nodes,
+   but do not use their Admin API yet. If you need to perform Admin API
+   requests, these should be made to the old cluster's nodes. The reason
+   is to prevent the new cluster from generating data that is not understood
+   by the old cluster.
+3. Gradually divert traffic away from your old nodes, and into
+   your 2.3.x cluster. Monitor your traffic to make sure everything
+   is going smoothly.
+4. When your traffic is fully migrated to the 2.3.x cluster,
+   decommission your old nodes.
+5. From your 2.3.x cluster, run: `kong migrations finish`.
+   From this point on, it will not be possible to start
+   nodes in the old cluster pointing to the same datastore anymore. Only run
+   this command when you are confident that your migration
+   was successful. From now on, you can safely make Admin API
+   requests to your 2.3.x nodes.
+
+**Cassandra**
+
+Due to internal changes, the table schemas used by Kong 2.3.x on Cassandra
+are incompatible with those used by Kong 2.1.x (or lower). Migrating using the usual commands
+`kong migrations up` and `kong migrations finish` will require a small
+window of downtime, since the old and new versions cannot use the
+database at the same time. Alternatively, to keep your previous version fully
+operational while the new one initializes, you will need to transfer the
+data to a new keyspace via a database dump, as described below:
+
+1. Download 2.3.x, and configure it to point to a new keyspace.
+   Run `kong migrations bootstrap`.
+2. Once that finishes running, both the old (pre-2.1) and new (2.3.x)
+   clusters can now run simultaneously, but the new cluster does not
+   have any data yet.
+3. On the old cluster, run `kong config db_export`. This will create
+   a file `kong.yml` with a database dump.
+4. Transfer the file to the new cluster and run
+   `kong config db_import kong.yml`. This will load the data into the new cluster.
+5. Gradually divert traffic away from your old nodes, and into
+   your 2.3.x cluster. Monitor your traffic to make sure everything
+   is going smoothly.
+6. When your traffic is fully migrated to the 2.3.x cluster,
+   decommission your old nodes.
+
+### Installing 2.3.x on a fresh datastore
+
+The following commands should be used to prepare a new 2.3.x cluster from a
+fresh datastore. By default the `kong` CLI tool will load the configuration
+from `/etc/kong/kong.conf`, but you can optionally use the flag `-c` to
+indicate the path to your configuration file:
+
+```
+$ kong migrations bootstrap [-c /path/to/your/kong.conf]
+$ kong start [-c /path/to/your/kong.conf]
+```
+
+## Upgrade to `2.2.0`
+
+Kong adheres to [semantic versioning](https://semver.org/), which makes a
+distinction between "major", "minor", and "patch" versions. The upgrade path
+will be different depending on which previous version from which you are migrating.
+
+If you are migrating from 2.0.0 or 2.1.x, upgrading into 2.2.x is a minor upgrade,
+but read below for important instructions on database migration, especially
+for Cassandra users.
+
+If you are migrating from 1.x, upgrading into 2.2.x is a major upgrade,
+so, in addition, be aware of any [breaking changes](#breaking-changes-2.0.0)
+between the 1.x and 2.x series below, further detailed in the
+[CHANGELOG.md](https://github.com/Kong/kong/blob/2.0.0/CHANGELOG.md) document.
+
+
+#### 1. Dependencies
+
+If you are using the provided binary packages, all necessary dependencies
+for the gateway are bundled and you can skip this section.
+
+If you are building your dependencies by hand, there are changes since the
+previous release, so you will need to rebuild them with the latest patches.
+
+The required OpenResty version for kong 2.2.x is
+[1.17.8.2](https://openresty.org/en/changelog-1017008.html). This is more recent
+than the version in Kong 2.1.0 (which used `1.15.8.3`). In addition to an upgraded
+OpenResty, you will need the correct [OpenResty
+patches](https://github.com/Kong/kong-build-tools/tree/master/openresty-build-tools/openresty-patches)
+for this new version, including the latest release of
+[lua-kong-nginx-module](https://github.com/Kong/lua-kong-nginx-module).
+The [kong-build-tools](https://github.com/Kong/kong-build-tools)
+repository contains [openresty-build-tools](https://github.com/Kong/kong-build-tools/tree/master/openresty-build-tools),
+which allows you to build OpenResty with the necessary patches
+and modules easily.
+
+For Go support, you also need to build both your plugins and
+the [Kong go-pluginserver](https://github.com/kong/go-pluginserver).
+The documentation includes detailed [instructions on how to build
+the plugin server and your plugins](https://docs.konghq.com/2.2.x/go/).
+
+#### 2. Template Changes
+
+There are **Changes in the Nginx configuration file**, between kong 2.0.0,
+2.1.0 and 2.2.0.
+
+To view the configuration changes between versions, clone the
+[Kong repository](https://github.com/kong/kong) and run `git diff`
+on the configuration templates, using `-w` for greater readability.
+
+Here's how to see the differences between 2.0.0 and 2.2.0:
+
+```
+git clone https://github.com/kong/kong
+cd kong
+git diff -w 2.0.0 2.2.0 kong/templates/nginx_kong*.lua
+```
+
+To produce a patch file, use the following command:
+
+```
+git diff 2.0.0 2.2.0 kong/templates/nginx_kong*.lua > kong_config_changes.diff
+```
+
+#### 3. Suggested Upgrade Path
+
+##### Upgrade from `0.x` to `2.2.0`
+
+The lowest version that Kong 2.2.0 supports migrating from is 1.0.0.
+If you are migrating from a version lower than 0.14.1, you need to
+migrate to 0.14.1 first. Then, once you are migrating from 0.14.1,
+please migrate to 1.5.0 first.
+
+The steps for upgrading from 0.14.1 to 1.5.0 are the same as upgrading
+from 0.14.1 to Kong 1.0. Please follow the steps described in the
+"Migration Steps from 0.14" in the [Suggested Upgrade Path for Kong
+1.0](#kong-1-0-upgrade-path), with the addition of the `kong
+migrations migrate-apis` command, which you can use to migrate legacy
+`apis` configurations.
+
+Once you migrated to 1.5.0, you can follow the instructions in the section
+below to migrate to 2.2.0.
+
+##### Upgrade from `1.0.0` - `2.1.0` to `2.2.0`
+
+**Postgres**
+
+Kong 2.2.0 supports a no-downtime migration model. This means that while the
+migration is ongoing, you will have two Kong clusters running, sharing the
+same database. (This is sometimes called the Blue/Green migration model.)
+
+The migrations are designed so that the new version of Kong is able to use
+the database as it is migrated while the old Kong cluster keeps working until
+it is time to decommission it. For this reason, the migration is split into
+two steps, performed via commands `kong migrations up` (which does
+only non-destructive operations) and `kong migrations finish` (which puts the
+database in the final expected state for Kong 2.2.0).
+
+1. Download 2.2.0, and configure it to point to the same datastore
+   as your old (1.0 to 2.0) cluster. Run `kong migrations up`.
+2. Once that finishes running, both the old (pre-2.1) and new (2.2.0)
+   clusters can now run simultaneously. Start provisioning 2.2.0 nodes,
+   but do not use their Admin API yet. If you need to perform Admin API
+   requests, these should be made to the old cluster's nodes. The reason
+   is to prevent the new cluster from generating data that is not understood
+   by the old cluster.
+3. Gradually divert traffic away from your old nodes, and into
+   your 2.2.0 cluster. Monitor your traffic to make sure everything
+   is going smoothly.
+4. When your traffic is fully migrated to the 2.2.0 cluster,
+   decommission your old nodes.
+5. From your 2.2.0 cluster, run: `kong migrations finish`.
+   From this point on, it will not be possible to start
+   nodes in the old cluster pointing to the same datastore anymore. Only run
+   this command when you are confident that your migration
+   was successful. From now on, you can safely make Admin API
+   requests to your 2.2.0 nodes.
+
+**Cassandra**
+
+Due to internal changes, the table schemas used by Kong 2.2.0 on Cassandra
+are incompatible with those used by Kong 2.0.0. Migrating using the usual commands
+`kong migrations up` and `kong migrations finish` will require a small
+window of downtime, since the old and new versions cannot use the
+database at the same time. Alternatively, to keep your previous version fully
+operational while the new one initializes, you will need to transfer the
+data to a new keyspace via a database dump, as described below:
+
+1. Download 2.2.0, and configure it to point to a new keyspace.
+   Run `kong migrations bootstrap`.
+2. Once that finishes running, both the old (pre-2.1) and new (2.2.0)
+   clusters can now run simultaneously, but the new cluster does not
+   have any data yet.
+3. On the old cluster, run `kong config db_export`. This will create
+   a file `kong.yml` with a database dump.
+4. Transfer the file to the new cluster and run
+   `kong config db_import kong.yml`. This will load the data into the new cluster.
+5. Gradually divert traffic away from your old nodes, and into
+   your 2.2.0 cluster. Monitor your traffic to make sure everything
+   is going smoothly.
+6. When your traffic is fully migrated to the 2.2.0 cluster,
+   decommission your old nodes.
+
+##### Installing 2.2.0 on a Fresh Datastore
+
+The following commands should be used to prepare a new 2.2.0 cluster from a
+fresh datastore. By default the `kong` CLI tool will load the configuration
+from `/etc/kong/kong.conf`, but you can optionally use the flag `-c` to
+indicate the path to your configuration file:
+
+```
+$ kong migrations bootstrap [-c /path/to/your/kong.conf]
+$ kong start [-c /path/to/your/kong.conf]
+```
 
 ## Upgrade to `2.1.0`
 
@@ -2023,7 +3416,7 @@ with your 0.13 nodes anymore. This is why we suggest either performing this
 upgrade when your 0.13 cluster is warm and most entities are cached, or against
 a new database, if you can migrate your data. If you wish to temporarily make
 your APIs unavailable, you can leverage the
-[request-termination](https://getkong.org/plugins/request-termination/) plugin.
+[request-termination](https://docs.konghq.com/hub/kong-inc/request-termination/) plugin.
 
 The path to upgrade a 0.13 datastore is identical to the one of previous major
 releases:
@@ -2084,7 +3477,7 @@ to **run migrations** and upgrade from a previous version of Kong.
 
 - The `proxy_listen` and `admin_listen` configuration values have a new syntax.
   See the configuration file or the [0.13.x
-  documentation](https://getkong.org/docs/0.13.x/configuration/) for insights
+  documentation](https://docs.konghq.com/0.13.x/configuration/) for insights
   on the new syntax.
 - The nginx configuration file has changed, which means that you need to update
   it if you are using a custom template. The changes are detailed in a diff
@@ -2184,8 +3577,8 @@ from the Admin API. Services and Routes are the new first-class citizen
 entities that new users (or users upgrading their clusters) should configure.
 
 You can read more about Services and Routes in the [Proxy
-Guide](https://getkong.org/docs/0.13.x/proxy/) and the [Admin API
-Reference](https://getkong.org/docs/0.13.x/admin-api/).
+Guide](https://docs.konghq.com/0.13.x/proxy/) and the [Admin API
+Reference](https://docs.konghq.com/0.13.x/admin-api/).
 
 #### 3. Suggested Upgrade Path
 
@@ -2196,7 +3589,7 @@ with your 0.12 nodes anymore. This is why we suggest either performing this
 upgrade when your 0.12 cluster is warm and most entities are cached, or against
 a new database if you can migrate your data. If you wish to temporarily make
 your APIs unavailable, you can leverage the
-[request-termination](https://getkong.org/plugins/request-termination/) plugin.
+[request-termination](https://docs.konghq.com/plugins/request-termination/) plugin.
 
 The path to upgrade a 0.12 datastore is identical to the one of previous major
 releases:
@@ -2335,7 +3728,7 @@ with your 0.11 nodes anymore. This is why we suggest either performing this
 upgrade when your 0.11 cluster is warm and most entities are cached, or against
 a new database, if you can migrate your data. If you wish to temporarily make
 your APIs unavailable, you can leverage the
-[request-termination](https://getkong.org/plugins/request-termination/) plugin.
+[request-termination](https://docs.konghq.com/plugins/request-termination/) plugin.
 
 The path to upgrade a 0.11 datastore is identical to the one of previous major
 releases:
@@ -2408,7 +3801,7 @@ complete list of changes and new features.
 **Note for Docker users:** Because of the aforementioned breaking change, if
 you are running Kong with Docker, you will now need to run the migrations from
 a single, ephemeral container. You can follow the [Docker installation
-instructions](https://getkong.org/install/docker/) (see "2. Prepare your
+instructions](https://docs.konghq.com/install/docker/) (see "2. Prepare your
 database") for more details about this process.
 
 ##### Core
@@ -2461,7 +3854,7 @@ database") for more details about this process.
   `database_cache.lua` module. Database entities caching and eviction has been
   greatly improved to simplify and automate most caching use-cases. See the
   [plugins development
-  guide](https://getkong.org/docs/0.11.x/plugin-development/entities-cache/)
+  guide](https://docs.konghq.com/0.11.x/plugin-development/entities-cache/)
   for more details about the new underlying mechanism, or see the below
   section of this document on how to update your plugin's cache invalidation
   mechanism for 0.11.0.
@@ -2471,7 +3864,7 @@ database") for more details about this process.
   specific bundled plugin, you might have to update your plugin's `PRIORITY`
   field as well. The complete list of plugins and their priorities is available
   on the [plugins development
-  guide](https://getkong.org/docs/0.11.x/plugin-development/custom-logic/).
+  guide](https://docs.konghq.com/0.11.x/plugin-development/custom-logic/).
 
 #### Deprecations
 
@@ -2822,7 +4215,7 @@ with your 0.10 nodes anymore. This is why we suggest either performing this
 upgrade when your 0.10 cluster is warm and most entities are cached, or against
 a new database, if you can migrate your data. If you wish to temporarily make
 your APIs unavailable, you can leverage the new
-[request-termination](https://getkong.org/plugins/request-termination/) plugin.
+[request-termination](https://docs.konghq.com/hub/kong-inc/request-termination/) plugin.
 
 The path to upgrade a 0.10 datastore is identical to the one of previous major
 releases:
@@ -2865,7 +4258,7 @@ Kong 0.10 introduced the following breaking changes:
 - API Objects (as configured via the Admin API) do **not** support the
   `request_host` and `request_uri` fields anymore. The 0.10 migrations should
   upgrade your current API Objects, but make sure to read the new [0.10 Proxy
-  Guide](https://getkong.org/docs/0.10.x/proxy) to learn the new routing
+  Guide](https://docs.konghq.com/0.10.x/proxy/) to learn the new routing
   capabilities of Kong. This means that Kong can now route incoming requests
   according to a combination of Host headers, URIs, and HTTP
   methods.
@@ -2873,7 +4266,7 @@ Kong 0.10 introduced the following breaking changes:
 - Dynamic SSL certificates serving is now handled by the core and **not**
   through the `ssl` plugin anymore. This version introduced the `/certificates`
   and `/snis` endpoints. See the new [0.10 Proxy
-  Guide](https://getkong.org/docs/0.10.x/proxy) to learn more about how to
+  Guide](https://docs.konghq.com/0.10.x/proxy/) to learn more about how to
   configure your SSL certificates on your APIs. The `ssl` plugin has been
   removed.
 - The preferred version of OpenResty is now `1.11.2.2`. However, this version
@@ -2881,7 +4274,7 @@ Kong 0.10 introduced the following breaking changes:
   Make sure to do so if you install OpenResty and Kong from source.
 - Dnsmasq is not a dependency anymore (However, be careful before removing it
   if you configured it to be your DNS name server via Kong's [`resolver`
-  property](https://getkong.org/docs/0.9.x/configuration/#dns-resolver-section))
+  property](https://docs.konghq.com/0.9.x/configuration/#dns-resolver-section))
 - The `cassandra_contact_points` property does not allow specifying a port
   anymore. All Cassandra nodes must listen on the same port, which can be
   tweaked via the `cassandra_port` property.
@@ -3068,7 +4461,7 @@ Secondly, if you installed Kong from source or maintain a development
 installation, you will need to have [Serf](https://www.serfdom.io) installed on
 your system and available in your `$PATH`. Serf is included with all the
 distribution packages and images available at
-[getkong.org/install](https://getkong.org/install/).
+[getkong.org/install](https://konghq.com/get-started/#install).
 
 The same way, this should already be the case but make sure that LuaJIT is in
 your `$PATH` too as the CLI interpreter switched from Lua 5.1 to LuaJIT.
@@ -3083,7 +4476,7 @@ $ kong restart [-c configuration_file]
 
 Read more about the new clustering capabilities of Kong 0.6.0 and its
 configurations in the [Clustering
-documentation](https://getkong.org/docs/0.6.x/clustering/).
+documentation](https://docs.konghq.com/0.6.x/clustering/).
 
 ## Upgrade to `0.5.x`
 

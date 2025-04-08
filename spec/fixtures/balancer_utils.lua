@@ -2,13 +2,14 @@ local cjson = require "cjson"
 local declarative = require "kong.db.declarative"
 local helpers = require "spec.helpers"
 local utils = require "kong.tools.utils"
+local https_server = require "spec.fixtures.https_server"
+
 
 local CONSISTENCY_FREQ = 0.1
 local FIRST_PORT = 20000
 local HEALTHCHECK_INTERVAL = 0.01
 local SLOTS = 10
-local TEST_LOG = false -- extra verbose logging of test server
-local TIMEOUT = -1  -- marker for timeouts in http_server
+local TEST_LOG = false -- extra verbose logging
 local healthchecks_defaults = {
   active = {
     timeout = 1,
@@ -53,16 +54,16 @@ end
 
 
 local function direct_request(host, port, path, protocol, host_header)
-  local pok, client = pcall(helpers.http_client, host, port)
+  local pok, client = pcall(helpers.http_client, {
+    host = host,
+    port = port,
+    scheme = protocol,
+  })
   if not pok then
     return nil, "pcall: " .. client .. " : " .. host ..":"..port
   end
   if not client then
     return nil, "client"
-  end
-
-  if protocol == "https" then
-    assert(client:ssl_handshake())
   end
 
   local res, err = client:send {
@@ -80,80 +81,48 @@ end
 
 
 local function post_target_endpoint(upstream_id, host, port, endpoint)
+  if host == "[::1]" then
+    host = "[0000:0000:0000:0000:0000:0000:0000:0001]"
+  end
   local path = "/upstreams/" .. upstream_id
                              .. "/targets/"
                              .. utils.format_host(host, port)
                              .. "/" .. endpoint
   local api_client = helpers.admin_client()
-  local res, err = assert(api_client:send {
-    method = "POST",
-    path = prefix .. path,
+  local res, err = assert(api_client:post(prefix .. path, {
     headers = {
       ["Content-Type"] = "application/json",
     },
     body = {},
-  })
+  }))
   api_client:close()
   return res, err
 end
 
 
--- Modified http-server. Accepts (sequentially) a number of incoming
--- connections and then rejects a given number of connections.
--- @param host Host name to use (IPv4 or IPv6 localhost).
--- @param port Port number to use.
--- @param counts Array of response counts to give,
--- odd entries are 200s, event entries are 500s
--- @param test_log (optional, default fals) Produce detailed logs
--- @return Returns the number of successful and failure responses.
-local function http_server(host, port, counts, test_log, protocol, check_hostname)
-  -- This is a "hard limit" for the execution of tests that launch
-  -- the custom http_server
-  local hard_timeout = ngx.now() + 300
-  protocol = protocol or "http"
-
-  local cmd = "resty --errlog-level error " .. -- silence _G write guard warns
-              "spec/fixtures/balancer_https_server.lua " ..
-              protocol .. " " .. host .. " " .. port ..
-              " \"" .. cjson.encode(counts):gsub('"', '\\"') .. "\" " ..
-              (test_log or "false") .. " ".. (check_hostname or "false") .. " &"
-  os.execute(cmd)
-
-  repeat
-    local _, err = direct_request(host, port, "/handshake", protocol)
-    if err then
-      ngx.sleep(0.01) -- poll-wait
-    end
-  until (ngx.now() > hard_timeout) or not err
-
-  local server = {}
-  server.done = function(_, host_header)
-    local body = direct_request(host, port, "/shutdown", protocol, host_header)
-    if body then
-      local tbl = assert(cjson.decode(body))
-      return true, tbl.ok_responses, tbl.fail_responses, tbl.n_checks
-    end
-  end
-
-  return server
-end
-
-
-local function client_requests(n, host_or_headers, proxy_host, proxy_port, protocol)
+local function client_requests(n, host_or_headers, proxy_host, proxy_port, protocol, uri)
   local oks, fails = 0, 0
   local last_status
   for _ = 1, n do
-    local client = (proxy_host and proxy_port)
-                   and helpers.http_client(proxy_host, proxy_port)
-                   or  helpers.proxy_client()
+    local client
+    if proxy_host and proxy_port then
+      client = helpers.http_client({
+        host = proxy_host,
+        port = proxy_port,
+        scheme = protocol,
+      })
 
-    if protocol == "https" then
-      assert(client:ssl_handshake())
+    else
+      if protocol == "https" then
+        client = helpers.proxy_ssl_client()
+      else
+        client = helpers.proxy_client()
+      end
     end
 
     local res = client:send {
       method = "GET",
-      path = "/",
+      path = uri or "/",
       headers = type(host_or_headers) == "string"
                 and { ["Host"] = host_or_headers }
                 or host_or_headers
@@ -188,9 +157,10 @@ local patch_upstream
 local get_upstream
 local get_upstream_health
 local get_balancer_health
-local post_target_address_health
+local put_target_address_health
 local get_router_version
 local add_target
+local update_target
 local add_api
 local patch_api
 local gen_port
@@ -269,9 +239,9 @@ do
     end
   end
 
-  post_target_address_health = function(upstream_id, target_id, address, mode, forced_port)
+  put_target_address_health = function(upstream_id, target_id, address, mode, forced_port)
     local path = "/upstreams/" .. upstream_id .. "/targets/" .. target_id .. "/" .. address .. "/" .. mode
-    return api_send("POST", path, {}, forced_port)
+    return api_send("PUT", path, {}, forced_port)
   end
 
   get_router_version = function(forced_port)
@@ -326,11 +296,25 @@ do
   add_target = function(bp, upstream_id, host, port, data)
     port = port or gen_port()
     local req = utils.deep_copy(data) or {}
+    if host == "[::1]" then
+      host = "[0000:0000:0000:0000:0000:0000:0000:0001]"
+    end
     req.target = req.target or utils.format_host(host, port)
     req.weight = req.weight or 10
     req.upstream = { id = upstream_id }
-    bp.targets:insert(req)
-    return port
+    local new_target = bp.targets:insert(req)
+    return port, new_target
+  end
+
+  update_target = function(bp, upstream_id, host, port, data)
+    local req = utils.deep_copy(data) or {}
+    if host == "[::1]" then
+      host = "[0000:0000:0000:0000:0000:0000:0000:0001]"
+    end
+    req.target = req.target or utils.format_host(host, port)
+    req.weight = req.weight or 10
+    req.upstream = { id = upstream_id }
+    bp.targets:update(req.id or req.target, req)
   end
 
   add_api = function(bp, upstream_name, opts)
@@ -340,6 +324,11 @@ do
     local route_host = gen_sym("host")
     local sproto = opts.service_protocol or opts.route_protocol or "http"
     local rproto = opts.route_protocol or "http"
+
+    local rpaths = {
+      "/",
+      "~/(?<namespace>[^/]+)/(?<id>[0-9]+)/?", -- uri capture hash value
+    }
 
     bp.services:insert({
       id = service_id,
@@ -356,7 +345,27 @@ do
       protocols = { rproto },
       hosts = rproto ~= "tcp" and { route_host } or nil,
       destinations = (rproto == "tcp") and {{ port = 9100 }} or nil,
+      paths = rproto ~= "tcp" and rpaths or nil,
     })
+
+    bp.plugins:insert({
+      name = "post-function",
+      service = { id = service_id },
+      config = {
+        header_filter = {[[
+          local value = ngx.ctx and
+                        ngx.ctx.balancer_data and
+                        ngx.ctx.balancer_data.hash_value
+          if value == "" or value == nil then
+            value = "NONE"
+          end
+
+          ngx.header["x-balancer-hash-value"] = value
+          ngx.header["x-uri"] = ngx.var.request_uri
+        ]]},
+      },
+    })
+
     return route_host, service_id, route_id
   end
 
@@ -373,6 +382,9 @@ local poll_wait_health
 local poll_wait_address_health
 do
   local function poll_wait(upstream_id, host, port, admin_port, fn)
+    if host == "[::1]" then
+      host = "[0000:0000:0000:0000:0000:0000:0000:0001]"
+    end
     local hard_timeout = ngx.now() + 70
     while ngx.now() < hard_timeout do
       local health = get_upstream_health(upstream_id, admin_port)
@@ -423,7 +435,8 @@ local function wait_for_router_update(bp, old_rv, localhost, proxy_port, admin_p
   local dummy_upstream_name, dummy_upstream_id = add_upstream(bp)
   local dummy_port = add_target(bp, dummy_upstream_id, localhost)
   local dummy_api_host = add_api(bp, dummy_upstream_name)
-  local dummy_server = http_server(localhost, dummy_port, { 1000 })
+  local dummy_server = https_server.new(dummy_port, localhost)
+  dummy_server:start()
 
   -- forces the router to be rebuild, reduces the flakiness of the test suite
   -- TODO: find out what's wrong with router invalidation in the particular
@@ -436,7 +449,7 @@ local function wait_for_router_update(bp, old_rv, localhost, proxy_port, admin_p
     return rv ~= old_rv
   end, 5)
 
-  dummy_server:done()
+  dummy_server:shutdown()
 end
 
 
@@ -520,15 +533,15 @@ local function teardown_prefix()
 end
 
 
-local function test_with_prefixes(_it, strategy, prefixes)
+local function test_with_prefixes(itt, strategy, prefixes)
   return function(description, fn)
     if strategy == "off" then
-      _it(description, fn)
+      itt(description, fn)
       return
     end
 
     for _, name in ipairs(prefixes) do
-      _it(name .. ": " .. description, function()
+      itt(name .. ": " .. description, function()
         setup_prefix("/" .. name)
         local ok = fn()
         teardown_prefix()
@@ -541,7 +554,7 @@ end
 
 local localhosts = {
   ipv4 = "127.0.0.1",
-  ipv6 = "[0000:0000:0000:0000:0000:0000:0000:0001]",
+  ipv6 = "[::1]",
   hostname = "localhost",
 }
 
@@ -553,6 +566,7 @@ local balancer_utils = {}
 --balancer_utils.
 balancer_utils.add_api = add_api
 balancer_utils.add_target = add_target
+balancer_utils.update_target = update_target
 balancer_utils.add_upstream = add_upstream
 balancer_utils.remove_upstream = remove_upstream
 balancer_utils.begin_testcase_setup = begin_testcase_setup
@@ -571,17 +585,15 @@ balancer_utils.get_upstream = get_upstream
 balancer_utils.get_upstream_health = get_upstream_health
 balancer_utils.healthchecks_config = healthchecks_config
 balancer_utils.HEALTHCHECK_INTERVAL = HEALTHCHECK_INTERVAL
-balancer_utils.http_server = http_server
 balancer_utils.localhosts = localhosts
 balancer_utils.patch_api = patch_api
 balancer_utils.patch_upstream = patch_upstream
 balancer_utils.poll_wait_address_health = poll_wait_address_health
 balancer_utils.poll_wait_health = poll_wait_health
-balancer_utils.post_target_address_health = post_target_address_health
+balancer_utils.put_target_address_health = put_target_address_health
 balancer_utils.post_target_endpoint = post_target_endpoint
 balancer_utils.SLOTS = SLOTS
 balancer_utils.tcp_client_requests = tcp_client_requests
-balancer_utils.TIMEOUT = TIMEOUT
 balancer_utils.wait_for_router_update = wait_for_router_update
 balancer_utils.test_with_prefixes = test_with_prefixes
 

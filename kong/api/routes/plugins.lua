@@ -3,7 +3,6 @@ local utils = require "kong.tools.utils"
 local reports = require "kong.reports"
 local endpoints = require "kong.api.endpoints"
 local arguments = require "kong.api.arguments"
-local singletons = require "kong.singletons"
 local api_helpers = require "kong.api.api_helpers"
 
 
@@ -123,9 +122,11 @@ return {
 
   ["/plugins/schema/:name"] = {
     GET = function(self, db)
-      kong.log.warn("DEPRECATED: /plugins/schema/:name endpoint " ..
-                    "is deprecated, please use /schemas/plugins/:name " ..
-                    "instead.")
+      kong.log.deprecation("/plugins/schema/:name endpoint is deprecated, ",
+                           "please use /schemas/plugins/:name instead", {
+                             after = "1.2.0",
+                             removal = "3.0.0",
+                           })
       local subschema = db.plugins.schema.subschemas[self.params.name]
       if not subschema then
         return kong.response.exit(404, { message = "No plugin named '" .. self.params.name .. "'" })
@@ -139,7 +140,7 @@ return {
   ["/plugins/enabled"] = {
     GET = function()
       local enabled_plugins = setmetatable({}, cjson.array_mt)
-      for k in pairs(singletons.configuration.loaded_plugins) do
+      for k in pairs(kong.configuration.loaded_plugins) do
         enabled_plugins[#enabled_plugins+1] = k
       end
       return kong.response.exit(200, {

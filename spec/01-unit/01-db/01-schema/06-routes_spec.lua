@@ -125,10 +125,10 @@ describe("routes schema", function()
 
   it("conflicting protocols produces error", function()
     local protocols_tests = {
-      { {"http", "tcp"}, "('http', 'https'), ('tcp', 'tls')" },
-      { {"http", "tls"}, "('http', 'https'), ('tcp', 'tls')" },
-      { {"https", "tcp"}, "('http', 'https'), ('tcp', 'tls')" },
-      { {"https", "tls"}, "('http', 'https'), ('tcp', 'tls')" },
+      { {"http", "tcp"}, "('http', 'https'), ('tcp', 'tls', 'udp')" },
+      { {"http", "tls"}, "('http', 'https'), ('tcp', 'tls', 'udp')" },
+      { {"https", "tcp"}, "('http', 'https'), ('tcp', 'tls', 'udp')" },
+      { {"https", "tls"}, "('http', 'https'), ('tcp', 'tls', 'udp')" },
     }
 
     for _, test in ipairs(protocols_tests) do
@@ -227,7 +227,7 @@ describe("routes schema", function()
 
       local ok, err = Routes:validate(route)
       assert.falsy(ok)
-      assert.equal("should start with: /", err.paths[1])
+      assert.equal("should start with: / (fixed path) or ~/ (regex path)", err.paths[1])
     end)
 
     it("must not have empty segments (/foo//bar)", function()
@@ -251,7 +251,7 @@ describe("routes schema", function()
       local u = require("spec.helpers").unindent
 
       local invalid_paths = {
-        [[/users/(foo/profile]],
+        [[~/users/(foo/profile]],
       }
 
       for i = 1, #invalid_paths do
@@ -383,7 +383,6 @@ describe("routes schema", function()
       local invalid_hosts = {
         "/example",
         ".example",
-        "example.",
         "example:",
         "mock;bin",
         "example.com/org",
@@ -696,6 +695,8 @@ describe("routes schema", function()
         "examp;le",
         "examp/le",
         "examp le",
+        -- see tests for utils.validate_utf8 for more invalid values
+        string.char(105, 213, 205, 149),
       }
 
       for i = 1, #invalid_names do
@@ -703,12 +704,9 @@ describe("routes schema", function()
           name = invalid_names[i],
           protocols = {"http"}
         }
-
         local ok, err = Routes:validate(route)
         assert.falsy(ok)
-        assert.equal(
-          "invalid value '" .. invalid_names[i] .. "': it must only contain alphanumeric and '., -, _, ~' characters",
-          err.name)
+        assert.matches("invalid", err.name)
       end
     end)
 
@@ -723,6 +721,9 @@ describe("routes schema", function()
         "3x4_mp_13",
         "~3x4~mp~13",
         "~3..x4~.M-p~1__3_",
+        "孔",
+        "Конг",
+        "🦍",
       }
 
       for i = 1, #valid_names do
@@ -768,9 +769,22 @@ describe("routes schema", function()
       assert.same({ "tls" }, route.protocols)
     end)
 
-    it("if 'protocol = tcp/tls', then 'paths' is empty", function()
+    it("'protocol' accepts 'udp'", function()
       local s = { id = "a4fbd24e-6a52-4937-bd78-2536713072d2" }
-      for _, v in ipairs({ "tcp", "tls" }) do
+      local route = Routes:process_auto_fields({
+        protocols = { "udp" },
+        sources = {{ ip = "127.0.0.1" }},
+        service = s,
+      }, "insert")
+      local ok, errs = Routes:validate(route)
+      assert.is_nil(errs)
+      assert.truthy(ok)
+      assert.same({ "udp" }, route.protocols)
+    end)
+
+    it("if 'protocol = tcp/tls/udp', then 'paths' is empty", function()
+      local s = { id = "a4fbd24e-6a52-4937-bd78-2536713072d2" }
+      for _, v in ipairs({ "tcp", "tls", "udp" }) do
         local route = Routes:process_auto_fields({
           protocols = { v },
           sources = {{ ip = "127.0.0.1" }},
@@ -780,14 +794,14 @@ describe("routes schema", function()
         local ok, errs = Routes:validate(route)
         assert.falsy(ok)
         assert.same({
-          paths = "cannot set 'paths' when 'protocols' is 'tcp' or 'tls'",
+          paths = "cannot set 'paths' when 'protocols' is 'tcp', 'tls', 'tls_passthrough' or 'udp'",
         }, errs)
       end
     end)
 
-    it("if 'protocol = tcp/tls', then 'methods' is empty", function()
+    it("if 'protocol = tcp/tls/udp', then 'methods' is empty", function()
       local s = { id = "a4fbd24e-6a52-4937-bd78-2536713072d2" }
-      for _, v in ipairs({ "tcp", "tls" }) do
+      for _, v in ipairs({ "tcp", "tls", "udp" }) do
         local route = Routes:process_auto_fields({
           protocols = { v },
           sources = {{ ip = "127.0.0.1" }},
@@ -797,7 +811,7 @@ describe("routes schema", function()
         local ok, errs = Routes:validate(route)
         assert.falsy(ok)
         assert.same({
-          methods = "cannot set 'methods' when 'protocols' is 'tcp' or 'tls'",
+          methods = "cannot set 'methods' when 'protocols' is 'tcp', 'tls', 'tls_passthrough' or 'udp'",
         }, errs)
       end
     end)
@@ -809,7 +823,7 @@ describe("routes schema", function()
         "destinations"
       }) do
         it("'" .. v .. "' accepts valid IPs and ports", function()
-          for _, protocol in ipairs({ "tcp", "tls" }) do
+          for _, protocol in ipairs({ "tcp", "tls", "udp" }) do
             local route = Routes:process_auto_fields({
               protocols = { protocol },
               [v] = {
@@ -826,7 +840,7 @@ describe("routes schema", function()
         end)
 
         it("'" .. v .. "' accepts valid IPs (no port)", function()
-          for _, protocol in ipairs({ "tcp", "tls" }) do
+          for _, protocol in ipairs({ "tcp", "tls", "udp" }) do
             local route = Routes:process_auto_fields({
               protocols = { protocol },
               [v] = {
@@ -844,7 +858,7 @@ describe("routes schema", function()
         end)
 
         it("'" .. v .. "' accepts valid ports (no IP)", function()
-          for _, protocol in ipairs({ "tcp", "tls" }) do
+          for _, protocol in ipairs({ "tcp", "tls", "udp" }) do
             local route = Routes:process_auto_fields({
               protocols = { protocol },
               [v] = {
@@ -862,7 +876,7 @@ describe("routes schema", function()
         end)
 
         it("'" .. v .. "' rejects invalid 'port' values", function()
-          for _, protocol in ipairs({ "tcp", "tls" }) do
+          for _, protocol in ipairs({ "tcp", "tls", "udp" }) do
             local route = Routes:process_auto_fields({
               protocols = { protocol },
               [v] = {
@@ -882,7 +896,7 @@ describe("routes schema", function()
         it("'" .. v .. "' rejects invalid 'ip' values", function()
           -- invalid IPs
           for _, ip_val in ipairs({ "127.", ":::1", "-1", "localhost", "foo" }) do
-            for _, protocol in ipairs({ "tcp", "tls" }) do
+            for _, protocol in ipairs({ "tcp", "tls", "udp" }) do
               local route = Routes:process_auto_fields({
                 protocols = { protocol },
                 [v] = {
@@ -899,7 +913,7 @@ describe("routes schema", function()
 
           -- hostnames
           for _, ip_val in ipairs({ "f", "example.org" }) do
-            for _, protocol in ipairs({ "tcp", "tls" }) do
+            for _, protocol in ipairs({ "tcp", "tls", "udp" }) do
               local route = Routes:process_auto_fields({
                 protocols = { protocol },
                 [v] = {
@@ -917,10 +931,9 @@ describe("routes schema", function()
 
         it("'" .. v .. "' accepts valid 'ip cidr' values", function()
           -- valid CIDRs
-          for _, ip_val in ipairs({ "1/0", "2130706433/2", "4294967295/3",
-                                    "0.0.0.0/0", "::/0", "0.0.0.0/1", "::/1",
+          for _, ip_val in ipairs({ "0.0.0.0/0", "::/0", "0.0.0.0/1", "::/1",
                                     "0.0.0.0/32", "::/128" }) do
-            for _, protocol in ipairs({ "tcp", "tls" }) do
+            for _, protocol in ipairs({ "tcp", "tls", "udp" }) do
               local route = Routes:process_auto_fields({
                 protocols = { protocol },
                 [v] = {
@@ -938,10 +951,11 @@ describe("routes schema", function()
 
         it("'" .. v .. "' rejects invalid 'ip cidr' values", function()
           -- invalid CIDRs
-          for _, ip_val in ipairs({ "-1/0", "4294967296/2", "0.0.0.0/a",
+          for _, ip_val in ipairs({ "1/0", "2130706433/2", "4294967295/3",
+                                    "-1/0", "4294967296/2", "0.0.0.0/a",
                                     "::/a", "0.0.0.0/-1", "::/-1",
                                     "0.0.0.0/33", "::/129" }) do
-            for _, protocol in ipairs({ "tcp", "tls" }) do
+            for _, protocol in ipairs({ "tcp", "tls", "udp" }) do
               local route = Routes:process_auto_fields({
                 protocols = { protocol },
                 [v] = {
@@ -996,9 +1010,9 @@ describe("routes schema", function()
         end
       end)
 
-      it("rejects specifying 'snis' if 'protocols' does not have 'https' or 'tls'", function()
+      it("rejects specifying 'snis' if 'protocols' does not have 'https', 'tls' or 'tls_passthrough'", function()
         local route = Routes:process_auto_fields({
-          protocols = { "tcp" },
+          protocols = { "tcp", "udp" },
           snis = { "example.org" },
           service = s,
         }, "insert")
@@ -1006,7 +1020,7 @@ describe("routes schema", function()
         assert.falsy(ok)
         assert.same({
           ["@entity"] = {
-            "'snis' can only be set when 'protocols' is 'grpcs', 'https' or 'tls'",
+            "'snis' can only be set when 'protocols' is 'grpcs', 'https', 'tls' or 'tls_passthrough'",
           },
           snis = "length must be 0",
         }, errs)
@@ -1015,7 +1029,7 @@ describe("routes schema", function()
 
     it("errors if no L4 matching attribute set", function()
       local s = { id = "a4fbd24e-6a52-4937-bd78-2536713072d2" }
-      for _, v in ipairs({ "tcp", "tls" }) do
+      for _, v in ipairs({ "tcp", "tls", "udp" }) do
         local route = Routes:process_auto_fields({
           protocols = { v },
           service = s,
@@ -1024,7 +1038,7 @@ describe("routes schema", function()
         assert.falsy(ok)
         assert.same({
           ["@entity"] = {
-            "must set one of 'sources', 'destinations', 'snis' when 'protocols' is 'tcp' or 'tls'"
+            "must set one of 'sources', 'destinations', 'snis' when 'protocols' is 'tcp', 'tls' or 'udp'"
           }
         }, errs)
       end
@@ -1163,6 +1177,34 @@ describe("routes schema", function()
     assert.falsy(ok)
     assert.same({
       strip_path = "cannot set 'strip_path' when 'protocols' is 'grpc' or 'grpcs'"
+    }, errs)
+  end)
+
+  it("errors if tls and tls_passthrough set on a same route", function()
+    local s = { id = "a4fbd24e-6a52-4937-bd78-2536713072d2" }
+    local route = Routes:process_auto_fields({
+      snis = { "foo.grpc.com" },
+      protocols = { "tls", "tls_passthrough" },
+      service = s,
+    }, "insert")
+    local ok, errs = Routes:validate(route)
+    assert.falsy(ok)
+    assert.same({
+      protocols = "these sets are mutually exclusive: ('tcp', 'tls', 'udp'), ('tls_passthrough')",
+    }, errs)
+  end)
+
+  it("errors if snis is not set on tls_pasthrough", function()
+    local s = { id = "a4fbd24e-6a52-4937-bd78-2536713072d2" }
+    local route = Routes:process_auto_fields({
+      sources = {{ ip = "127.0.0.1" }},
+      protocols = { "tls_passthrough" },
+      service = s,
+    }, "insert")
+    local ok, errs = Routes:validate(route)
+    assert.falsy(ok)
+    assert.same({
+      ["@entity"] =  { "must set snis when 'protocols' is 'tls_passthrough'" },
     }, errs)
   end)
 end)

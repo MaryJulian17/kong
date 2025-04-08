@@ -68,6 +68,31 @@ for _, strategy in helpers.each_strategy() do
           },
         }
 
+        local service = assert(bp.services:insert())
+        local route   = bp.routes:insert({
+          service     = service,
+          protocols   = { "http" },
+          paths       = { "/proxy-authorization" },
+          strip_path  = true,
+        })
+
+        bp.plugins:insert({
+          route = route,
+          name = "request-transformer",
+          config = {
+            add = {
+              headers = {
+                "Proxy-Authorization:Basic ZGVtbzp0ZXN0",
+              },
+            },
+            replace = {
+              headers = {
+                "Proxy-Authorization:Basic ZGVtbzp0ZXN0",
+              },
+            },
+          },
+        })
+
         assert(helpers.start_kong(config))
       end
     end
@@ -106,10 +131,12 @@ for _, strategy in helpers.each_strategy() do
           ["Proxy"]               = "Remove-Me", -- See: https://httpoxy.org/
           ["Proxy-Connection"]    = "close",
           -- This is a response header, so we don't remove it, should we?
-          --["Proxy-Authenticate"]  = "Basic",
+          ["Proxy-Authenticate"]  = "Basic",
           ["Proxy-Authorization"] = "Basic YWxhZGRpbjpvcGVuc2VzYW1l",
           ["TE"]                  = "trailers, deflate;q=0.5",
-          ["Transfer-Encoding"]   = "identity",
+          --["Transfer-Encoding"]   = "identity", -- Removed with OpenResty 1.19.3.1 as Nginx errors with:
+                                                  -- client sent unknown "Transfer-Encoding": "identity"
+
           -- This is a response header, so we don't remove it, should we?
           --["Trailer"]             = "Expires",
           ["Upgrade"]             = "example/1, foo/2",
@@ -122,11 +149,11 @@ for _, strategy in helpers.each_strategy() do
         assert.is_nil(headers["keep-alive"])
         assert.is_nil(headers["proxy"])
         assert.is_nil(headers["proxy-connection"])
-        assert.is_nil(headers["proxy-authenticate"])
-        assert.is_nil(headers["proxy-authorization"])
         assert.is_nil(headers["upgrade"])
         assert.is_nil(headers["x-boo"])
         assert.is_nil(headers["x-bar"])
+        assert.equal("Basic", headers["proxy-authenticate"])
+        assert.equal("Basic YWxhZGRpbjpvcGVuc2VzYW1l", headers["proxy-authorization"])
         assert.equal("trailers", headers["te"]) -- trailers are kept
         assert.equal("Keep-Me", headers["x-foo-bar"])
         assert.equal("Keep-Me", headers["close"])
@@ -150,7 +177,7 @@ for _, strategy in helpers.each_strategy() do
         --assert.is_nil(headers["proxy"])
         -- This is a request header, so we don't remove it, should we?
         --assert.is_nil(headers["proxy-connection"])
-        assert.is_nil(headers["proxy-authenticate"])
+        --assert.is_nil(headers["proxy-authenticate"])
         -- This is a request header, so we don't remove it, should we?
         --assert.is_nil(headers["proxy-authorization"])
         -- This is a request header, so we don't remove it, should we?
@@ -192,6 +219,26 @@ for _, strategy in helpers.each_strategy() do
         local json = cjson.decode(assert.res_status(200, res))
         assert.equal("keep-alive, Upgrade", json.headers.connection)
         assert.equal("websocket", json.headers.upgrade)
+      end)
+
+      it("keeps proxy-authorization header when a plugin specifies it", function()
+        local headers = request_headers({
+          ["Proxy-Authorization"] = "Basic YWxhZGRpbjpvcGVuc2VzYW1l",
+        }, "/proxy-authorization")
+
+        assert.equal("Basic ZGVtbzp0ZXN0", headers["proxy-authorization"])
+
+        local headers = request_headers({}, "/proxy-authorization")
+
+        assert.equal("Basic ZGVtbzp0ZXN0", headers["proxy-authorization"])
+      end)
+
+      it("keeps proxy-authorization header if plugin specifies same value as in requests", function()
+        local headers = request_headers({
+          ["Proxy-Authorization"] = "Basic ZGVtbzp0ZXN0",
+        }, "/proxy-authorization")
+
+        assert.equal("Basic ZGVtbzp0ZXN0", headers["proxy-authorization"])
       end)
     end)
 
@@ -299,6 +346,25 @@ for _, strategy in helpers.each_strategy() do
         end)
       end)
 
+      describe("X-Forwarded-Path", function()
+        it("should be added if not present in request", function()
+          local headers = request_headers {
+            ["Host"] = "headers-inspect.com",
+          }
+
+          assert.equal("/", headers["x-forwarded-path"])
+        end)
+
+        it("should be replaced if present in request", function()
+          local headers = request_headers {
+            ["Host"]             = "headers-inspect.com",
+            ["X-Forwarded-Path"] = "/replaced",
+          }
+
+          assert.equal("/", headers["x-forwarded-path"])
+        end)
+      end)
+
       describe("X-Forwarded-Prefix", function()
         it("should be added if path was stripped", function()
           local headers = request_headers({}, "/foo/status/200")
@@ -338,6 +404,7 @@ for _, strategy in helpers.each_strategy() do
           assert.equal("127.0.0.1", headers["x-forwarded-for"])
           assert.equal("http", headers["x-forwarded-proto"])
           assert.equal("preserved.com", headers["x-forwarded-host"])
+          assert.equal("/", headers["x-forwarded-path"])
           assert.equal(helpers.get_proxy_port(false), tonumber(headers["x-forwarded-port"]))
         end)
 
@@ -357,6 +424,7 @@ for _, strategy in helpers.each_strategy() do
           assert.equal("http", headers["x-forwarded-proto"])
           assert.equal("preserved.com", headers["x-forwarded-host"])
           assert.equal(helpers.get_proxy_port(false), tonumber(headers["x-forwarded-port"]))
+          assert.equal("/", headers["x-forwarded-path"])
         end)
       end)
 
@@ -374,6 +442,7 @@ for _, strategy in helpers.each_strategy() do
           assert.equal("http", headers["x-forwarded-proto"])
           assert.equal("headers-inspect.com", headers["x-forwarded-host"])
           assert.equal(helpers.get_proxy_port(false), tonumber(headers["x-forwarded-port"]))
+          assert.equal("/", headers["x-forwarded-path"])
         end)
 
         it("if present in request while discarding the downstream host", function()
@@ -394,6 +463,7 @@ for _, strategy in helpers.each_strategy() do
           assert.equal("http", headers["x-forwarded-proto"])
           assert.equal("headers-inspect.com", headers["x-forwarded-host"])
           assert.equal(helpers.get_proxy_port(false), tonumber(headers["x-forwarded-port"]))
+          assert.equal("/", headers["x-forwarded-path"])
         end)
       end)
 
@@ -503,6 +573,25 @@ for _, strategy in helpers.each_strategy() do
           }
 
           assert.equal("80", headers["x-forwarded-port"])
+        end)
+      end)
+
+      describe("X-Forwarded-Path", function()
+        it("should be added if not present in request", function()
+          local headers = request_headers {
+            ["Host"] = "headers-inspect.com",
+          }
+
+          assert.equal("/", headers["x-forwarded-path"])
+        end)
+
+        it("should be forwarded if present in request", function()
+          local headers = request_headers {
+            ["Host"]             = "headers-inspect.com",
+            ["X-Forwarded-Path"] = "/original-path",
+          }
+
+          assert.equal("/original-path", headers["x-forwarded-path"])
         end)
       end)
 
@@ -629,6 +718,25 @@ for _, strategy in helpers.each_strategy() do
           }
 
           assert.equal(helpers.get_proxy_port(false), tonumber(headers["x-forwarded-port"]))
+        end)
+      end)
+
+      describe("X-Forwarded-Path", function()
+        it("should be added if not present in request", function()
+          local headers = request_headers {
+            ["Host"] = "headers-inspect.com",
+          }
+
+          assert.equal("/", headers["x-forwarded-path"])
+        end)
+
+        it("should be replaced if present in request", function()
+          local headers = request_headers {
+            ["Host"]             = "headers-inspect.com",
+            ["X-Forwarded-Path"] = "/untrusted",
+          }
+
+          assert.equal("/", headers["x-forwarded-path"])
         end)
       end)
 
